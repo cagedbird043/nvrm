@@ -194,6 +194,8 @@ NVK_PATCH_LIST = [
     # VRAM (BAR1) memory type, as the proprietary driver offers none; BAR1
     # does not return the modifier's byte layout there.
     HERE / "nvk-prevolta-modifier-memory-types.patch",
+    # RM creates an independent channel group and ring for every VkQueue.
+    HERE / "nvk-rm-graphics-multiqueue.patch",
 ]
 
 def prepared_stamp(source, inputs):

@@ -138,6 +138,19 @@ Mesa's GLSL frontend keeps float min/max NaN-preserving and NVIDIA FMNMX/stock r
 non-NaN operand. GTA SA's vehicle specular `max(pow(x<0, 10.0), 0.0)` rendered car paint black
 under ANGLE on 26.2 (`tests/vk-nan-minmax.c`, live A/B 2026-10-16).
 
+`nvk-rm-graphics-multiqueue.patch`: the graphics family exposes two queues for
+Android 17 HWUI's RenderThread and GrallocUploadThread. NVK already creates a
+separate exec context, push stream and initial graphics state per VkQueue;
+`rm_ctx_create` creates a new Rust Queue with its own TSG, context-share,
+channel, GPFIFO/USERD, tail and completion surface. The Rust device mutex
+protects shared memory/sync bookkeeping while different API threads submit;
+the queues do not alias one ring. Build the independent public Vulkan
+regression with `cc -std=c11 -Wall -Wextra -Werror
+tools/native-vulkan-multiqueue.c -ldl -pthread -o PROBE` (use the NDK API33
+compiler for each Android ABI), then run `PROBE /absolute/path/to/ICD.so`.
+It checks the first graphics family's count, creates both queues and verifies
+512 simultaneous-thread buffer-fill submissions by CPU readback.
+
 Mesa util patches for the shader disk cache, applied to the NVK and the GL tree (upstream-style messages in each file):
 `mesa-disk-cache-create-with-path.patch` (`disk_cache_create_with_path()`: a cache at an absolute,
 per-application directory, enabled on every platform, driver_flags kept),

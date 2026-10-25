@@ -18,7 +18,7 @@ fn fail(e: VideoError) -> i32 {
     e.code()
 }
 
-fn guard(f: impl FnOnce() -> Result<i32, VideoError>) -> i32 {
+pub(super) fn guard(f: impl FnOnce() -> Result<i32, VideoError>) -> i32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => fail(e),
@@ -128,7 +128,7 @@ pub struct NvVideoTarget {
     pub reserved: [u32; 2],
 }
 
-fn null<T>(p: *const T, what: &str) -> Result<(), VideoError> {
+pub(super) fn null<T>(p: *const T, what: &str) -> Result<(), VideoError> {
     if p.is_null() {
         Err(VideoError::Invalid(format!("{what} is NULL")))
     } else {

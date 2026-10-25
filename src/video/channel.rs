@@ -1,12 +1,15 @@
-//! One NVDEC channel: TSG on the NVDEC0 runlist, SYNC context share, host
-//! GPFIFO channel, decoder-class object (setup facts as in the V0 spike,
-//! nvdec.rs), plus a 64-bit completion timeline on an RM semaphore surface so
-//! that completion is observable without CPU polling: the CPU waits on a
-//! sync_file of that surface, other channels acquire its payload.
+//! One video-engine channel (NVDEC or NVENC): TSG on the engine's runlist,
+//! SYNC context share, host GPFIFO channel, engine-class object (setup facts
+//! as in the V0 spike, nvdec.rs), plus a 64-bit completion timeline on an RM
+//! semaphore surface so that completion is observable without CPU polling:
+//! the CPU waits on a sync_file of that surface, other channels acquire its
+//! payload.
 //!
-//! Stock reference: per-picture submission order and status handling,
-//! stock libnvcuvid 615.71.09 at ELF 0x141d50; stock waits on its own shared
-//! semaphore between the two NVDEC engines, we use one engine.
+//! Stock reference (NVDEC): per-picture submission order and status
+//! handling, stock libnvcuvid 615.71.09 at ELF 0x141d50; stock waits on its
+//! own shared semaphore between the two NVDEC engines, we use one engine.
+//! NVENC: the same channel sequence with engineType NVENC0 and the object
+//! bound on subchannel 0 (mickys/nvenc docs/design.md "M1 notes", MIT).
 use super::{VResult, VideoError};
 use crate::{
     fences::NativeFenceSurface,
@@ -15,13 +18,15 @@ use crate::{
 };
 use std::{os::fd::AsRawFd, rc::Rc, time::Duration};
 
-const NV2080_ENGINE_TYPE_NVDEC0: u32 = 0x13;
+pub const NV2080_ENGINE_TYPE_NVDEC0: u32 = 0x13;
+/// cl2080_notification.h: NV2080_ENGINE_TYPE_NVENC0 = MSENC = 0x1b.
+pub const NV2080_ENGINE_TYPE_NVENC0: u32 = 0x1b;
 const ENTRIES: usize = 1024;
 const COMMAND_BYTES: usize = 65536;
 
-pub struct NvdecChannel {
+pub struct EngineChannel {
     device: Rc<Device>,
-    pub decoder_class: u32,
+    pub class: u32,
     /// Host GPFIFO class (relocation encoding, `super::reloc`).
     pub host_class: u32,
     ring: Mapping,
@@ -41,13 +46,23 @@ pub struct NvdecChannel {
     _maps: Vec<crate::gpu::GpuMapping>,
 }
 
-impl NvdecChannel {
-    pub fn new(device: &Rc<Device>, space: &AddressSpace, decoder_class: u32) -> VResult<Self> {
+impl EngineChannel {
+    /// `engine`: NV2080_ENGINE_TYPE_* of the runlist; `class`: the engine
+    /// object (NVDEC 0xc9b0.., NVENC 0xc9b7..), allocated with
+    /// NV_BSP/NV_MSENC_ALLOCATION_PARAMETERS (same layout); `subchannel`: where
+    /// SET_OBJECT binds it (NVDEC 4 as stock, NVENC 0).
+    pub fn new(
+        device: &Rc<Device>,
+        space: &AddressSpace,
+        engine: u32,
+        class: u32,
+        subchannel: u32,
+    ) -> VResult<Self> {
         let caps = crate::capabilities::query(device)?;
         let host_class = caps.channel;
         if !crate::gpu::modern_host(host_class)? {
             return Err(VideoError::Unsupported(format!(
-                "NVDEC sessions need a Volta+ host class (have {host_class:#x})"
+                "video engine channels need a Volta+ host class (have {host_class:#x})"
             )));
         }
         let queue_memory = device.allocate_memory(65536, true)?;
@@ -58,7 +73,7 @@ impl NvdecChannel {
         let command = command_memory.map()?;
         let usermode = nvdec_usermode_class(&device.classes()?).ok_or_else(|| {
             VideoError::Unsupported(
-                "NVDEC doorbell: RM advertises neither HOPPER_USERMODE_A (0xc661) nor \
+                "video doorbell: RM advertises neither HOPPER_USERMODE_A (0xc661) nor \
                  VOLTA_USERMODE_A (0xc361)"
                     .into(),
             )
@@ -70,10 +85,10 @@ impl NvdecChannel {
             ring.write_u32(i * 4, 0)?;
         }
         // kernel_channel.c:741-785 (TSG engine == channel engine);
-        // kernel_fifo_gp102.c:144-160 (NVDEC needs a SYNC subcontext).
+        // kernel_fifo_gp102.c:144-160 (video engines need a SYNC subcontext).
         let mut group_params = crate::abi::ChannelGroup {
             vaspace: space.vaspace.handle,
-            engine: NV2080_ENGINE_TYPE_NVDEC0,
+            engine,
             ..Default::default()
         };
         let group = Object::new(
@@ -99,7 +114,7 @@ impl NvdecChannel {
             fifo_address: queue_va.address(),
             entries: ENTRIES as u32,
             context_share: context.handle,
-            engine: NV2080_ENGINE_TYPE_NVDEC0,
+            engine,
             ..Default::default()
         };
         channel_params.userd_memory[0] = queue_memory.handle;
@@ -111,19 +126,21 @@ impl NvdecChannel {
             &mut channel_params,
             vec![Rc::clone(&group), Rc::clone(&context)],
         )?;
-        device.client.compat.require_constant(
-            "NV2080_ENGINE_TYPE_NVDEC0",
-            u64::from(NV2080_ENGINE_TYPE_NVDEC0),
-        )?;
-        let mut decoder_params = crate::abi::VideoDecoder {
+        if engine == NV2080_ENGINE_TYPE_NVDEC0 {
+            device.client.compat.require_constant(
+                "NV2080_ENGINE_TYPE_NVDEC0",
+                u64::from(NV2080_ENGINE_TYPE_NVDEC0),
+            )?;
+        }
+        let mut engine_params = crate::abi::VideoDecoder {
             size: std::mem::size_of::<crate::abi::VideoDecoder>() as u32,
             ..Default::default()
         };
-        let decoder = Object::new(
+        let engine_object = Object::new(
             device,
             channel.handle,
-            decoder_class,
-            &mut decoder_params,
+            class,
+            &mut engine_params,
             vec![Rc::clone(&channel)],
         )?;
         let timeline = NativeFenceSurface::new(device, space, channel.handle)?;
@@ -136,7 +153,7 @@ impl NvdecChannel {
             .control(group.handle, 0xa06c0101, &mut [1u8, 0, 0])?;
         let mut ch = Self {
             device: Rc::clone(device),
-            decoder_class,
+            class,
             host_class,
             ring,
             command,
@@ -148,12 +165,12 @@ impl NvdecChannel {
             cmd_off: 0,
             submitted: 0,
             timeline,
-            objects: vec![decoder, channel, context, group],
+            objects: vec![engine_object, channel, context, group],
             _keep: vec![queue_memory, command_memory],
             _maps: vec![queue_va, command_va],
         };
         let mut bind = Vec::new();
-        method(&mut bind, 4, 0, &[decoder_class]); // SET_OBJECT
+        method(&mut bind, subchannel, 0, &[class]); // SET_OBJECT
         ch.submit(bind)?;
         Ok(ch)
     }
@@ -171,7 +188,7 @@ impl NvdecChannel {
         )?;
         let bytes = words.len() * 4;
         if bytes > COMMAND_BYTES / 8 {
-            return Err(VideoError::Invalid("NVDEC method list too long".into()));
+            return Err(VideoError::Invalid("video engine method list too long".into()));
         }
         // At most 4 pictures are in flight (descriptor ring), each well under
         // COMMAND_BYTES/8, so wrapping never overwrites unread commands.
@@ -201,7 +218,7 @@ impl NvdecChannel {
             let visible = self.ring.read_u32(ENTRIES * 8 + 0x8c)?;
             if visible != put {
                 return Err(VideoError::DeviceLost(format!(
-                    "NVDEC GP_PUT read back {visible} after writing {put}; channel state unknown"
+                    "video engine GP_PUT read back {visible} after writing {put}; channel state unknown"
                 )));
             }
             crate::platform::device_full_barrier();
@@ -226,7 +243,7 @@ impl NvdecChannel {
         wait_sync_file(fd.as_raw_fd(), Duration::from_secs(2)).map_err(|e| {
             let gpget = self.ring.read_u32(ENTRIES * 8 + 0x88).unwrap_or(u32::MAX);
             VideoError::DeviceLost(format!(
-                "NVDEC picture {value} did not complete ({e}; completed {:?}, GPGet {gpget}, put {})",
+                "video engine submission {value} did not complete ({e}; completed {:?}, GPGet {gpget}, put {})",
                 self.completed().ok(),
                 self.put
             ))
@@ -286,7 +303,7 @@ pub(crate) fn wait_sync_file(fd: i32, timeout: Duration) -> Result<(), String> {
     }
 }
 
-impl Drop for NvdecChannel {
+impl Drop for EngineChannel {
     fn drop(&mut self) {
         let _ = self.timeline.unbind();
         if let Some(group) = self.objects.last() {

@@ -21,6 +21,7 @@ pub mod hevc;
 #[cfg(test)]
 pub mod pretend;
 pub mod session;
+pub mod venc;
 pub mod vp9;
 
 use crate::rm::{self, Client};

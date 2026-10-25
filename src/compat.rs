@@ -337,6 +337,14 @@ impl Compat {
             | 0xc9b0 | 0xcdb0 | 0xceb0 | 0xcfb0 | 0xb8b0 | 0xd1b0 | 0xd2b0 => {
                 "NV_BSP_ALLOCATION_PARAMETERS"
             }
+            // NVxxB7_VIDEO_ENCODER: kernel_nvenc_engdesc.c (615.78.08:48-111)
+            // checks NV_MSENC_ALLOCATION_PARAMETERS' size. nvos.h declares
+            // NV_NVENC_ALLOCATION_PARAMETERS {size, prohibitMultipleInstances,
+            // engineInstance}, member for member the NV_NVDEC_ALLOCATION_PARAMETERS
+            // the BSP layout was probed from, so the encoder classes take that
+            // layout; explicit public class list (sdk/nvidia/inc/class/clxxb7.h).
+            0xb4b7 | 0xc0b7 | 0xc1b7 | 0xc2b7 | 0xc3b7 | 0xc4b7 | 0xc7b7 | 0xc9b7 | 0xceb7
+            | 0xcfb7 | 0xd0b7 | 0xd1b7 => "NV_BSP_ALLOCATION_PARAMETERS",
             // Only implemented public engine/usermode contracts may omit a
             // payload; runtime class discovery is an additional prerequisite.
             0xc361 | 0xc461 | 0xc561 | 0xc661 | 0xc761 | 0x902d | 0xa140 | 0xcd40 | 0xb097

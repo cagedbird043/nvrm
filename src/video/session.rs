@@ -13,7 +13,7 @@
 //!   copy engine understands through SET_SRC_BLOCK_SIZE.GOB_KIND (measured
 //!   2026-10-14, see video/README.md).
 use super::{
-    channel::{wait_sync_file, NvdecChannel},
+    channel::{wait_sync_file, EngineChannel, NV2080_ENGINE_TYPE_NVDEC0},
     hdr::HdrStaticMetadata,
     open_render_node, open_rm, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen,
     PictureInfo, SurfaceLayout, SurfaceRef, VResult, VideoDevice, VideoError, FORMAT_NV12,
@@ -246,7 +246,7 @@ pub(crate) fn engine_status_error(status: &[u8; 16], picture: u32) -> Option<Str
 pub struct Session {
     codec: Box<dyn CodecDecoder>,
     // Field order = drop order: channels before the memory they reference.
-    nvdec: NvdecChannel,
+    nvdec: EngineChannel,
     copy: CopyEngine,
     ring: Vec<RingSlot>,
     next_ring: usize,
@@ -393,7 +393,7 @@ impl Session {
         let (device, _) = open_rm(Some(dev.pci))?;
         let drm = open_render_node(dev.pci)?;
         let space = AddressSpace::new(&device)?;
-        let nvdec = NvdecChannel::new(&device, &space, class)?;
+        let nvdec = EngineChannel::new(&device, &space, NV2080_ENGINE_TYPE_NVDEC0, class, 4)?;
         let copy = CopyEngine::new(&device, &space)?;
         let mut side = Vec::new();
         codec.allocate(
@@ -458,7 +458,7 @@ impl Session {
     }
 
     pub fn decoder_class(&self) -> u32 {
-        self.nvdec.decoder_class
+        self.nvdec.class
     }
 
     fn free_surfaces(&self) -> Vec<usize> {
@@ -662,7 +662,7 @@ impl Session {
             self.ring[k].bits_size = size;
         }
         let ctx = BuildContext {
-            decoder_class: self.nvdec.decoder_class,
+            decoder_class: self.nvdec.class,
             host_class: self.nvdec.host_class,
             descriptor: self.ring[k].desc.gpu.address(),
             bitstream: self.ring[k].bits.as_ref().map_or(0, |b| b.gpu.address()),
@@ -853,7 +853,7 @@ impl Session {
             wait_sync_file(t.acquire_fence_fd, Duration::from_secs(5))
                 .map_err(|e| VideoError::Invalid(format!("acquire fence: {e}")))?;
         }
-        let src_kinds = self.codec.gob_kinds(self.nvdec.decoder_class);
+        let src_kinds = self.codec.gob_kinds(self.nvdec.class);
         let blackwell_ce = self.copy.copy_class >= 0xc9b5;
         let mut w = Vec::new();
         method(&mut w, 4, 0, &[self.copy.copy_class]); // SET_OBJECT

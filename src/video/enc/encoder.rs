@@ -1,7 +1,7 @@
 //! NVENC session ported from mickys/nvenc enc.c/enc.h (MIT, 90d1d6a).
 //! Picture setups preserve the C core's bytes; RM ownership and completion are native Rust.
 use super::{
-    av1hdr, av1probs, h264hdr, hevchdr, layout, nvenc_drv::*, tmpl_av1::*, tmpl_h264::*,
+    av1hdr, av1probs, h264hdr, hevchdr, ingest, layout, nvenc_drv::*, tmpl_av1::*, tmpl_h264::*,
     tmpl_hevc::*,
 };
 use crate::video::{
@@ -164,6 +164,8 @@ impl Default for Pending {
 pub struct Encoder {
     // Drop the channel before allocations/device. Drop waits for queued work first.
     chan: EngineChannel,
+    ingest: Option<ingest::Ingest>,
+    stage: Mem,
     pub cfg: EncConfig,
     rm: NvVencDevice,
     wmb: usize,
@@ -465,6 +467,8 @@ impl Encoder {
         let av1_hq = av1 && (cfg.quality || cfg.bframes > 0);
         Ok(Self {
             chan,
+            ingest: None,
+            stage: Mem::default(),
             cfg: c,
             rm,
             wmb,
@@ -770,6 +774,68 @@ impl Encoder {
         layout::in_tile_plane(l, y, ys, 2 * w, h, 2 * self.pitch);
         layout::in_tile_plane(c, uv, uvs, 4 * w, h, 4 * self.pitch);
         Ok(())
+    }
+    /// Fills the next input slot from an external 4:2:0 dma-buf on the copy engine (NV12 for 8-bit,
+    /// P010 for 10-bit encodes); the visible `cfg.width` x `cfg.height` region is copied and the
+    /// padding stays zero, exactly as with the CPU loaders. `key` identifies the buffer: its
+    /// import is cached until [`Encoder::forget_dmabuf`].
+    pub fn load_dmabuf(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
+        let ds = self.input_slot()?;
+        if src.bytes_per_sample as usize != self.bps || self.cfg.chroma444 {
+            return Err(invalid("dma-buf sample size or chroma format does not match the encoder"));
+        }
+        if self.cfg.aq != 0 && self.cfg.codec == ENC_HEVC {
+            return Err(invalid("spatial AQ needs CPU-visible luma"));
+        }
+        self.aq_valid[ds] = false;
+        let dst = ingest::Destination::Tiled {
+            luma: self.input[ds].gpu,
+            chroma: self.input[ds].gpu + self.luma_sz as u64,
+            pitch: (self.pitch * self.bps) as u32,
+            width: self.cfg.width as u32,
+            height: self.cfg.height as u32,
+        };
+        if self.ingest.is_none() {
+            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
+        }
+        let ingest = self.ingest.as_mut().unwrap();
+        ingest.copy(&self.rm, key, src, &dst)
+    }
+    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4): the
+    /// copy engine brings the visible region into a pitch-linear staging buffer and the CPU converts
+    /// it with [`Encoder::load_bgra`]. This GPU has no compute path here, so colour conversion
+    /// is the one step that still touches pixels on the CPU.
+    pub fn load_dmabuf_bgra(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
+        self.input_slot()?;
+        if src.bytes_per_sample != 4 || self.bps != 1 || self.cfg.chroma444 {
+            return Err(invalid("BGRA dma-buf needs an 8-bit 4:2:0 encoder"));
+        }
+        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+        let pitch = up(w * 4, 64);
+        if self.stage.size < pitch * h {
+            self.stage = Mem::alloc(&mut self.rm, pitch * h, 4096, true)?;
+        }
+        let dst = ingest::Destination::Linear {
+            address: self.stage.gpu,
+            pitch: pitch as u32,
+            width: w as u32,
+            height: h as u32,
+        };
+        if self.ingest.is_none() {
+            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
+        }
+        let ingest = self.ingest.as_mut().unwrap();
+        ingest.copy(&self.rm, key, src, &dst)?;
+        let stage = std::mem::take(&mut self.stage);
+        let result = self.load_bgra(&stage.bytes()[..pitch * h], pitch);
+        self.stage = stage;
+        result
+    }
+    /// Drops the cached import of a buffer previously passed to [`Encoder::load_dmabuf`].
+    pub fn forget_dmabuf(&mut self, key: u64) {
+        if let Some(ingest) = self.ingest.as_mut() {
+            ingest.forget(key);
+        }
     }
     pub fn load_l10r(&mut self, src: &[u8], stride: usize) -> VResult<()> {
         let ds = self.input_slot()?;

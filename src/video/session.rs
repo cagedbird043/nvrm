@@ -47,13 +47,13 @@ pub struct SessionInfo {
     pub extra_output_slots: u32,
 }
 
-struct VramBuffer {
+pub(crate) struct VramBuffer {
     _memory: Rc<Memory>,
-    cpu: Mapping,
-    gpu: GpuMapping,
+    pub(crate) cpu: Mapping,
+    pub(crate) gpu: GpuMapping,
 }
 
-fn vram(device: &Rc<Device>, space: &AddressSpace, size: usize) -> VResult<VramBuffer> {
+pub(crate) fn vram(device: &Rc<Device>, space: &AddressSpace, size: usize) -> VResult<VramBuffer> {
     let memory = device
         .allocate_vram(size)
         .map_err(|e| VideoError::NoMemory(format!("VRAM {size} bytes: {e}")))?;
@@ -129,19 +129,19 @@ type Import = (Rc<Memory>, GpuMapping);
 
 /// Copy-engine context: a backend Queue (copy engine only), its own slot
 /// pool page, and per-copy command buffers.
-struct CopyEngine {
-    queue: Queue,
-    copy_class: u32,
+pub(crate) struct CopyEngine {
+    pub(crate) queue: Queue,
+    pub(crate) copy_class: u32,
     _pool: Arc<SlotPool>,
     _page: (Rc<Memory>, Mapping, GpuMapping),
     _events: RmEvents,
-    commands: Vec<(VramBuffer, u64)>,
+    pub(crate) commands: Vec<(VramBuffer, u64)>,
     /// Imported targets kept alive until their copy retired.
     pending: VecDeque<(u64, Vec<Import>)>,
 }
 
 impl CopyEngine {
-    fn new(device: &Rc<Device>, space: &AddressSpace) -> VResult<Self> {
+    pub(crate) fn new(device: &Rc<Device>, space: &AddressSpace) -> VResult<Self> {
         let caps = crate::capabilities::query(device)?;
         let view = if crate::gpu::modern_host(caps.channel)? {
             TimelineView::Native64

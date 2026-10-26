@@ -29,6 +29,7 @@ mod av1tables;
 mod encoder;
 pub mod h264hdr;
 pub mod hevchdr;
+pub mod ingest;
 pub mod layout;
 pub mod nvenc_drv;
 pub mod tmpl_av1;

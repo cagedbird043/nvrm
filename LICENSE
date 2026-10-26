@@ -33,6 +33,9 @@ Exceptions (inherit the upstream or stated license):
     licenses/                 notices of ash (MIT/Apache-2.0), tinygrad (MIT)
                               and NVIDIA's public headers (MIT)
     src/vp9_tables.rs         values from libvpx (BSD-3-Clause, notice in file)
+    src/video/vp8_init.bin    VP8 default probabilities of RFC 6386 (whose
+                              reference code is BSD-3-Clause), laid out for
+                              the decoder engine
     src/video/av1/cdf_defaults.rs
                               values from Mesa (MIT, AMD; notice in file)
     src/video/av1/testdata/   Big Buck Bunny (c) 2008 Blender Foundation,

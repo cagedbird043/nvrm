@@ -234,11 +234,12 @@ pub(crate) fn engine_status_error(status: &[u8; 16], picture: u32) -> Option<Str
     };
     (word(3) != 0).then(|| {
         format!(
-            "NVDEC error_status {:#x} ({} blocks in error) on picture {picture}: the decoded picture \
-             is wrong (malformed bitstream or a stream feature the descriptor does not describe); \
-             flush and restart at a key frame",
+            "NVDEC error_status {:#x} ({} blocks in error, {} decoded) on picture {picture}: the \
+             decoded picture is wrong (malformed bitstream or a stream feature the descriptor does \
+             not describe); flush and restart at a key frame",
             word(3),
-            word(1)
+            word(1),
+            word(0)
         )
     })
 }
@@ -254,6 +255,8 @@ pub struct Session {
     surface_refs: Vec<SurfaceRef>,
     /// Last copy-engine token reading each surface.
     surface_copy: Vec<u64>,
+    /// Pitch-linear frame assembled from field-stacked pictures on their way to block-linear targets.
+    weave_stage: Option<VramBuffer>,
     /// HDR static metadata declared by the unit that decoded each surface (a
     /// show_existing_frame outputs the metadata of the frame it shows).
     surface_hdr: Vec<HdrStaticMetadata>,
@@ -443,6 +446,7 @@ impl Session {
             ring,
             next_ring: 0,
             surface_copy: vec![0; surfaces.len()],
+            weave_stage: None,
             surface_hdr: vec![HdrStaticMetadata::default(); surfaces.len()],
             current_hdr: HdrStaticMetadata::default(),
             resize_needed: None,
@@ -489,6 +493,8 @@ impl Session {
         self.ring[k].unchecked = false;
         let mut b = [0u8; 16];
         self.ring[k].desc.cpu.read_bytes(off, &mut b)?;
+        let error = u32::from_le_bytes([b[12], b[13], b[14], b[15]]) & !self.codec.benign_status();
+        b[12..].copy_from_slice(&error.to_le_bytes());
         if let Some(m) = engine_status_error(&b, self.ring[k].picture) {
             self.failed = Some(m.clone());
             return Err(VideoError::Bitstream(m));
@@ -636,14 +642,17 @@ impl Session {
         timestamp: u64,
         hdr: HdrStaticMetadata,
     ) -> VResult<()> {
-        let current = *self
-            .free_surfaces()
-            .first()
-            // The unit was admitted by `decode`; running out now is an
-            // accounting bug (the codec already consumed state), not AGAIN.
-            .ok_or_else(|| {
-                VideoError::Invalid("no free DPB surface inside an admitted unit".into())
-            })?;
+        let current = match self.codec.output_surface() {
+            Some(surface) => surface,
+            None => *self
+                .free_surfaces()
+                .first()
+                // The unit was admitted by `decode`; running out now is an
+                // accounting bug (the codec already consumed state), not AGAIN.
+                .ok_or_else(|| {
+                    VideoError::Invalid("no free DPB surface inside an admitted unit".into())
+                })?,
+        };
         // A copy_out may still read this surface (picture released early).
         if self.surface_copy[current] != 0 && !self.copy.retired(self.surface_copy[current])? {
             let fd = self.copy.queue.context_fence(
@@ -846,6 +855,34 @@ impl Session {
         }
         let src_kinds = self.codec.gob_kinds(self.nvdec.class);
         let blackwell_ce = self.copy.copy_class >= 0xc9b5;
+        // A field-stacked picture (two field images per surface) is interleaved by the copy
+        // engine: each field is written to every other destination row (doubled destination
+        // pitch). Block-linear destinations cannot be addressed that way, so the frame is
+        // assembled in a pitch-linear staging buffer first and copied on.
+        let weave = self.codec.field_stacked();
+        if weave && (ct != 0 || (dst.planar && dst.block.is_some())) {
+            return Err(VideoError::Unsupported(
+                "field-stacked picture: crop from the top, or a planar block-linear target".into(),
+            ));
+        }
+        let staged = weave && dst.block.is_some();
+        if staged && self.weave_stage.is_none() {
+            self.weave_stage = Some(vram(&self.device, &self.space, self.layout.size)?);
+        }
+        let stage_va = self.weave_stage.as_ref().map_or(0, |b| b.gpu.address());
+        let (first_block, out_pitch, out_va) = if staged {
+            (
+                None,
+                [self.layout.pitch, self.layout.chroma_pitch, 0],
+                [stage_va, stage_va + self.layout.chroma_offset, 0],
+            )
+        } else {
+            (dst.block, t.pitch, plane_va)
+        };
+        let fields = if weave { 2 } else { 1 };
+        let (luma_field, chroma_field) =
+            super::legacy::field_offsets(self.layout.pitch, info.height.next_multiple_of(16));
+        let field_bytes = [u64::from(luma_field) * 256, u64::from(chroma_field) * 256];
         let mut w = Vec::new();
         method(&mut w, 4, 0, &[self.copy.copy_class]); // SET_OBJECT
         #[allow(clippy::needless_range_loop)] // plane index selects several per-plane values
@@ -888,62 +925,88 @@ impl Session {
             } else {
                 self.layout.chroma_pitch
             };
-            // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
-            let gob_kind = if blackwell_ce {
-                src_kinds[p.min(1)] << 16
-            } else {
-                0
-            };
-            method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
-            method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
-            method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
-            let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
-            if let Some(component) = remap {
-                // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
-                // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
-                method(
-                    &mut w,
-                    4,
-                    0x708,
-                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 20],
-                );
-                launch |= 1 << 10; // REMAP_ENABLE
-            }
-            match dst.block {
-                None => launch |= 1 << 8, // DST pitch
-                Some((h, kinds)) => {
-                    let dk = if blackwell_ce {
-                        kinds[p.min(1)] << 16
-                    } else {
-                        0
-                    };
-                    method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
-                    let dst_rows = rows.next_multiple_of(8 << h);
+            for f in 0..fields {
+                // Rows f, f + 2, ... of the frame come from field image f.
+                let rows = if weave { (rows + 1 - f) / 2 } else { rows };
+                let src_va = src_va + u64::from(f) * field_bytes[p.min(1)];
+                // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
+                let gob_kind = if blackwell_ce {
+                    src_kinds[p.min(1)] << 16
+                } else {
+                    0
+                };
+                method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
+                method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
+                method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
+                let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
+                if let Some(component) = remap {
+                    // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
+                    // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
                     method(
                         &mut w,
                         4,
-                        0x710,
-                        // With remapping X counts destination elements (one component of `bps` bytes).
-                        &[if remap.is_some() { dst.pitch[p] / bps } else { dst.pitch[p] }, dst_rows, 1, 0],
+                        0x708,
+                        &[component | 6 << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 20],
                     );
-                    method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
+                    launch |= 1 << 10; // REMAP_ENABLE
                 }
+                match first_block {
+                    None => launch |= 1 << 8, // DST pitch
+                    Some((h, kinds)) => {
+                        let dk = if blackwell_ce {
+                            kinds[p.min(1)] << 16
+                        } else {
+                            0
+                        };
+                        method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
+                        let dst_rows = rows.next_multiple_of(8 << h);
+                        method(
+                            &mut w,
+                            4,
+                            0x710,
+                            // With remapping X counts destination elements (one component of `bps` bytes).
+                            &[if remap.is_some() { dst.pitch[p] / bps } else { dst.pitch[p] }, dst_rows, 1, 0],
+                        );
+                        method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
+                    }
+                }
+                let [ih, il] = crate::gpu::hi_lo(src_va);
+                let [oh, ol] = crate::gpu::hi_lo(out_va[p] + u64::from(f) * u64::from(out_pitch[p]));
+                method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
+                method(
+                    &mut w,
+                    4,
+                    0x410,
+                    &[
+                        if p == 0 { self.layout.pitch } else { self.layout.chroma_pitch },
+                        out_pitch[p] * fields,
+                        line_bytes,
+                        rows,
+                    ],
+                );
+                method(&mut w, 4, 0x300, &[launch]);
             }
-            let [ih, il] = crate::gpu::hi_lo(src_va);
-            let [oh, ol] = crate::gpu::hi_lo(plane_va[p]);
-            method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
-            method(
-                &mut w,
-                4,
-                0x410,
-                &[
-                    if p == 0 { self.layout.pitch } else { self.layout.chroma_pitch },
-                    t.pitch[p],
-                    line_bytes,
-                    rows,
-                ],
-            );
-            method(&mut w, 4, 0x300, &[launch]);
+        }
+        if staged {
+            // Second pass: the woven pitch-linear frame into the block-linear target.
+            let (h, kinds) = dst.block.expect("staged implies a block-linear target");
+            for p in 0..2 {
+                let (rows, line_bytes) = if p == 0 {
+                    (ch, cw * bps)
+                } else {
+                    (ch.div_ceil(2), cw.div_ceil(2) * 2 * bps)
+                };
+                let dk = if blackwell_ce { kinds[p] << 16 } else { 0 };
+                method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]);
+                method(&mut w, 4, 0x710, &[dst.pitch[p], rows.next_multiple_of(8 << h), 1, 0]);
+                method(&mut w, 4, 0x74c, &[0, 0]);
+                let [ih, il] = crate::gpu::hi_lo(out_va[p]);
+                let [oh, ol] = crate::gpu::hi_lo(plane_va[p]);
+                method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
+                method(&mut w, 4, 0x410, &[out_pitch[p], t.pitch[p], line_bytes, rows]);
+                // SRC pitch layout, non-pipelined, flush, multi-line.
+                method(&mut w, 4, 0x300, &[2 | 1 << 2 | 1 << 7 | 1 << 9]);
+            }
         }
         // Command buffer: reuse one whose copy retired.
         let ci = match self.copy.commands.iter().position(|(_, tok)| {

@@ -19,10 +19,15 @@ pub mod enc;
 pub mod h264;
 pub mod hdr;
 pub mod hevc;
+pub mod legacy;
+pub mod mpeg2;
+pub mod mpeg4;
 #[cfg(test)]
 pub mod pretend;
 pub mod session;
 pub mod venc;
+pub mod vc1;
+pub mod vp8;
 pub mod vp9;
 
 use crate::rm::{self, Client};
@@ -38,6 +43,11 @@ pub const CODEC_H264: u32 = 1;
 pub const CODEC_HEVC: u32 = 2;
 pub const CODEC_VP9: u32 = 3;
 pub const CODEC_AV1: u32 = 4;
+/// Pre-VP9 formats, driven by external (VA) picture parameters only; not part of the C ABI.
+pub const CODEC_MPEG2: u32 = 5;
+pub const CODEC_MPEG4: u32 = 6;
+pub const CODEC_VC1: u32 = 7;
+pub const CODEC_VP8: u32 = 8;
 pub const FORMAT_NV12: u32 = 1;
 pub const FORMAT_P010: u32 = 2;
 pub const FORMAT_YUV420P: u32 = 3;
@@ -484,6 +494,21 @@ pub trait CodecDecoder {
     fn status_offset(&self) -> Option<usize> {
         None
     }
+    /// `error_status` bits the engine also sets on valid pictures (stock decodes them the same).
+    fn benign_status(&self) -> u32 {
+        0
+    }
+    /// Session surface the next job must write into instead of a free one (the second field of a
+    /// frame decodes into the surface of the first).
+    fn output_surface(&self) -> Option<usize> {
+        None
+    }
+    /// The engine stores every picture as two field images (the bottom field image at the offset
+    /// [`legacy::field_offsets`] gives), whatever its structure: MPEG-2 and the other pre-VP9
+    /// formats. `copy_out` interleaves the fields into a frame.
+    fn field_stacked(&self) -> bool {
+        false
+    }
 }
 
 /// Why this library refuses `codec` on `class` although stock decodes it there, or `None`.
@@ -549,6 +574,10 @@ impl NvdecEngineCaps {
             CODEC_HEVC => !self.hevc_off,
             CODEC_VP9 => !self.vp9_off,
             CODEC_AV1 => !self.av1_off,
+            // The pre-VP9 formats have no BSP caps bit of their own (stock asks the generation only);
+            // VP8 shares the VP9 engine's capsTbl[4] bit 2.
+            CODEC_MPEG2 | CODEC_MPEG4 | CODEC_VC1 => true,
+            CODEC_VP8 => self.vp8,
             _ => false,
         }
     }
@@ -598,6 +627,23 @@ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
             stock &= g.ga10x_plus();
             (c.min_width, c.min_height, c.max_width, c.max_height) = (128, 128, 8192, 8192);
             c.bit_depth_mask = 1 << 8 | 1 << 10;
+            c.chroma_420_only = 1;
+        }
+        // Stock (cuvidGetDecoderCaps, 4:2:0 8-bit, Ada 615.78): MPEG-2 48x16..4080², MPEG-4 and VC-1
+        // 48x16..2048², VP8 64x64..32768x16384.
+        CODEC_MPEG2 => {
+            (c.min_width, c.min_height, c.max_width, c.max_height) = (48, 16, 4080, 4080);
+            c.bit_depth_mask = 1 << 8;
+            c.chroma_420_only = 1;
+        }
+        CODEC_MPEG4 | CODEC_VC1 => {
+            (c.min_width, c.min_height, c.max_width, c.max_height) = (48, 16, 2048, 2048);
+            c.bit_depth_mask = 1 << 8;
+            c.chroma_420_only = 1;
+        }
+        CODEC_VP8 => {
+            (c.min_width, c.min_height, c.max_width, c.max_height) = (64, 64, 32768, 16384);
+            c.bit_depth_mask = 1 << 8;
             c.chroma_420_only = 1;
         }
         _ => stock = false,

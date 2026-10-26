@@ -25,10 +25,10 @@ pub struct NvVencDevice {
     // Drop order: channels and allocations before the address space and device.
     channels: HashMap<u64, EngineChannel>,
     allocations: HashMap<u64, Allocation>,
-    space: AddressSpace,
-    drm: std::fs::File,
-    device: Rc<Device>,
-    classes: Vec<u32>,
+    pub(crate) space: AddressSpace,
+    pub(crate) drm: std::fs::File,
+    pub(crate) device: Rc<Device>,
+    pub(crate) classes: Vec<u32>,
     next: u64,
 }
 // SAFETY: a device's RM objects are only reachable through it; nv_venc.h
@@ -56,7 +56,11 @@ fn newest(classes: &[u32], low: u32) -> u32 {
 
 impl NvVencDevice {
     fn open() -> VResult<Self> {
-        let (device, pci) = open_rm(None)?;
+        Self::open_on(None)
+    }
+
+    pub(crate) fn open_on(pci: Option<[u32; 4]>) -> VResult<Self> {
+        let (device, pci) = open_rm(pci)?;
         let classes = device.classes()?;
         if newest(&classes, 0xb7) == 0 {
             return Err(VideoError::Unsupported("this GPU advertises no NVENC class".into()));
@@ -80,7 +84,7 @@ impl NvVencDevice {
         id
     }
 
-    fn alloc(&mut self, size: u64, align: u64, system: bool, cpu: bool) -> VResult<NvVencMemory> {
+    pub(crate) fn alloc(&mut self, size: u64, align: u64, system: bool, cpu: bool) -> VResult<NvVencMemory> {
         let size = usize::try_from(size).map_err(|_| VideoError::Invalid("size".into()))?;
         let align = usize::try_from(align.max(4096))
             .map_err(|_| VideoError::Invalid("alignment".into()))?;

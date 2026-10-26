@@ -34,6 +34,10 @@ path = "src/bin/nv-video-avc-test.rs"
 name = "nv-nvdec-probe"
 path = "src/bin/nv-nvdec-probe.rs"
 
+[[bin]]
+name = "nv-venc-test"
+path = "src/bin/nv-venc-test.rs"
+
 [profile.release]
 # WorkerLiveness publishes loss and retains teardown ownership while unwinding.
 # Optimization must not replace this contract with process-wide panic abort.

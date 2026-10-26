@@ -1252,6 +1252,13 @@ impl Mapping {
         }
         Ok(())
     }
+    /// The whole mapping as bytes. Only for CPU-cached system memory whose writers (the GPU)
+    /// have completed; device memory must be read with [`Mapping::read_bytes`] instead.
+    pub(crate) fn system_bytes(&self) -> Result<&[u8]> {
+        self.live()?;
+        // SAFETY: the mapping is live and owns `size` bytes; callers synchronise with the writer.
+        Ok(unsafe { std::slice::from_raw_parts(self.pointer.as_ptr() as *const u8, self.size) })
+    }
     /// Bulk copy out of the mapping (bounds-checked, byte granular).
     pub(crate) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<()> {
         self.live()?;

@@ -1087,6 +1087,15 @@ impl Session {
         Ok(OutputAllocation { fd, memory })
     }
 
+    /// PRIME-shareable CPU-cached system memory for copy-engine output that the CPU reads back
+    /// (device memory would be read through the uncached BAR). Map it with
+    /// [`OutputAllocation::map`] once and read [`OutputMapping::bytes`] after `copy_out_wait`.
+    pub fn allocate_readback(&self, size: usize) -> VResult<OutputAllocation> {
+        let memory = self.device.allocate_aligned(size, 4096, false, true)?;
+        let fd = crate::external::export(&memory, self.drm.as_fd())?;
+        Ok(OutputAllocation { fd, memory })
+    }
+
     /// Complete a copy-out before the CPU maps its destination.
     pub fn copy_out_wait(&mut self, id: u64, target: &Target) -> VResult<()> {
         if let Some(fence) = self.copy_out(id, target)? {
@@ -1163,6 +1172,11 @@ pub struct OutputMapping {
     mapping: Mapping,
 }
 impl OutputMapping {
+    /// The mapped bytes of an allocation from [`Session::allocate_readback`], valid once the
+    /// copy engine's work on it has completed.
+    pub fn bytes(&self) -> VResult<&[u8]> {
+        Ok(self.mapping.system_bytes()?)
+    }
     pub fn read_bytes(&self, offset: usize, out: &mut [u8]) -> VResult<()> {
         Ok(self.mapping.read_bytes(offset, out)?)
     }

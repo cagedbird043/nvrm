@@ -75,6 +75,37 @@ fn qctx_thresholds() {
         [0, 0, 1, 1, 2, 2, 3, 3]
     );
 }
+#[test]
+fn client_picture_preserves_reference_cdf_and_segmentation() {
+    let mut codec = Av1Codec::new();
+    let seq = SequenceHeader { bit_depth: 8, ..Default::default() };
+    let mut hdr = FrameHeader {
+        frame_is_intra: true,
+        primary_ref_frame: PRIMARY_REF_NONE,
+        base_q_idx: 40,
+        upscaled_width: 64,
+        frame_width: 64,
+        frame_height: 64,
+        mi_cols: 16,
+        mi_rows: 16,
+        segmentation_enabled: true,
+        ..Default::default()
+    };
+    let first = codec.build_picture(seq.clone(), hdr.clone(), vec![], vec![], [None; 8]).unwrap();
+    assert_eq!(first.cdf_default_qctx, Some(1));
+    hdr.frame_is_intra = false;
+    hdr.frame_type = header::INTER_FRAME;
+    hdr.primary_ref_frame = 0;
+    hdr.disable_frame_end_update_cdf = true;
+    let second = codec.build_picture(seq.clone(), hdr.clone(), vec![], vec![], [Some(first.slot); 8]).unwrap();
+    assert_ne!(second.slot, first.slot);
+    assert_eq!(second.cdf_read, first.cdf_write);
+    assert_eq!(second.cdf_default_qctx, None);
+    assert_eq!(second.seg_read, Some(first.slot));
+    let third = codec.build_picture(seq, hdr, vec![], vec![], [Some(second.slot); 8]).unwrap();
+    assert_eq!(third.cdf_read, first.cdf_write);
+    assert_eq!(third.ref_slots, [Some(second.slot); 7]);
+}
 
 /// Dump every picture job of the IVF streams in $AV1_IVF_DIR to $AV1_OUT_DIR (descriptor block + job
 /// summary) for comparison with stock captures (compare script

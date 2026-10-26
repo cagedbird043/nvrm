@@ -119,6 +119,49 @@ impl HevcDecoder {
             gen: NvdecGen::of(decoder_class),
         })
     }
+
+    /// Session-owned layout for externally supplied HEVC picture parameters.
+    pub fn session_inputs(&self) -> SessionInputs {
+        self.dec.inputs
+    }
+
+    /// Submit a parameter-driven picture with hardware slots mapped to session surfaces.
+    pub fn build_picture(
+        &self,
+        ctx: &BuildContext,
+        d: &mut [u8],
+        setup: &[u8],
+        slots: &[Option<usize>; SLOTS],
+        control: u32,
+    ) -> VResult<Vec<u32>> {
+        d[..SETUP_SIZE].copy_from_slice(setup);
+        let cur = ctx.surfaces[ctx.current];
+        let mut w = Vec::new();
+        let reloc = |w: &mut Vec<u32>, m, va| ctx.reloc(w, m, va);
+        method(&mut w, 4, 0x200, &[super::APP_ID_HEVC]);
+        method(&mut w, 4, 0x400, &[control]);
+        reloc(&mut w, 0x404, ctx.descriptor);
+        reloc(&mut w, 0x408, ctx.bitstream);
+        for (i, slot) in slots.iter().enumerate() {
+            let s = slot.map_or(cur, |s| ctx.surfaces[s]);
+            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
+            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
+        }
+        reloc(&mut w, 0x414, self.colmv);
+        reloc(&mut w, 0x424, ctx.descriptor + STATUS);
+        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
+        reloc(&mut w, 0x580, ctx.descriptor + super::desc::SCALING_LIST_OFFSET as u64);
+        reloc(&mut w, 0x584, ctx.descriptor + super::desc::TILE_SIZES_OFFSET as u64);
+        reloc(&mut w, 0x588, self.filter);
+        if self.gen.ga10x_plus() {
+            reloc(&mut w, 0x4c8, self.intra_top);
+        }
+        if self.gen.blackwell_b() {
+            reloc(&mut w, 0x4dc, self.buf_4dc);
+        }
+        method(&mut w, 4, 0x300, &[0]);
+        Ok(w)
+    }
 }
 
 impl CodecDecoder for HevcDecoder {

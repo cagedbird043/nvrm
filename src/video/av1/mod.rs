@@ -138,6 +138,44 @@ impl Av1Codec {
         }
     }
 
+    /// Build a client-parsed picture using the client's authoritative reference map.
+    /// Slots name previously decoded pictures, not AV1 reference-map indices.
+    pub fn build_picture(
+        &mut self,
+        seq: SequenceHeader,
+        mut hdr: FrameHeader,
+        bitstream: Vec<u8>,
+        tiles: Vec<TileRange>,
+        references: [Option<usize>; 8],
+    ) -> Result<PictureJob> {
+        if references.iter().flatten().any(|&s| s >= DPB_SLOTS) {
+            return Err(Av1Error::Invalid("reference slot out of range"));
+        }
+        if hdr.ref_frame_idx.iter().any(|&i| i >= 8) || hdr.primary_ref_frame > PRIMARY_REF_NONE {
+            return Err(Av1Error::Invalid("reference index out of range"));
+        }
+        self.ref_map = references;
+        for (i, slot) in references.iter().enumerate() {
+            if let Some(slot) = slot {
+                self.parser.refs[i].order_hint = self.slots[*slot].rec.order_hint;
+            }
+        }
+        if !hdr.frame_is_intra {
+            for i in 0..7 {
+                let slot = references[hdr.ref_frame_idx[i] as usize]
+                    .ok_or(Av1Error::Invalid("missing client reference"))?;
+                hdr.order_hints[i] = self.slots[slot].rec.order_hint;
+                hdr.ref_frame_sign_bias[i] = header::get_relative_dist(
+                    &seq, hdr.order_hints[i], hdr.order_hint,
+                ) > 0;
+            }
+        }
+        if hdr.skip_mode_present && !self.parser.skip_mode_allowed(&seq, &mut hdr) {
+            return Err(Av1Error::Invalid("invalid skip-mode references"));
+        }
+        self.parser.seq = Some(seq);
+        self.finish_frame(hdr, bitstream, tiles)
+    }
     pub fn ref_map(&self) -> [Option<usize>; 8] {
         self.ref_map
     }

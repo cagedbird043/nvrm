@@ -52,6 +52,26 @@ struct Pending {
     header: FrameHeader,
 }
 
+/// External reference bindings for a VA picture. Probabilities and raw segment
+/// quantizer/filter deltas still come from the complete VP9 frame headers: VA's
+/// slice ABI contains derived dequant/filter tables, not those syntax values.
+#[derive(Default)]
+pub struct VaPicture {
+    pub references: [Option<(usize, u32, u32)>; 8],
+    pub width: u32,
+    pub height: u32,
+    pub fields: u32,
+    pub filter_level: u8,
+    pub sharpness: u8,
+    pub tile_cols: u32,
+    pub tile_rows: u32,
+    pub uncompressed_size: usize,
+    pub header_size: usize,
+    pub tree_probs: [u8; 7],
+    pub pred_probs: [u8; 3],
+    pub segment_flags: [u16; 8],
+}
+
 pub struct Vp9Decoder {
     st: Vp9State,
     frames: VecDeque<Vec<u8>>,
@@ -77,6 +97,7 @@ pub struct Vp9Decoder {
     bit_depth: u32,
     /// Per-generation gates of the session's NVDEC class.
     gen: NvdecGen,
+    va_picture: Option<VaPicture>,
 }
 
 impl Vp9Decoder {
@@ -99,6 +120,22 @@ impl Vp9Decoder {
             frame_len: 0,
             bit_depth,
             gen: NvdecGen::of(decoder_class),
+            va_picture: None,
+        }
+    }
+
+    /// Bind VA references before parsing/submitting one complete coded frame.
+    pub fn set_va_picture(&mut self, picture: VaPicture) {
+        self.va_picture = Some(picture);
+    }
+
+    fn reference(&self, index: usize) -> Option<(usize, u32, u32)> {
+        match &self.va_picture {
+            Some(p) => p.references[index],
+            None => self.st.slot_surface(index).map(|s| {
+                let (w, h) = self.st.slot_size(index);
+                (s, w, h)
+            }),
         }
     }
 
@@ -172,7 +209,7 @@ impl Vp9Decoder {
         if !key {
             // Stock fills ref dims for every non-key frame, intra-only included.
             for i in 0..3 {
-                let (w, hh) = self.st.slot_size(h.ref_frame_idx[i]);
+                let (_, w, hh) = self.reference(h.ref_frame_idx[i]).unwrap_or((ctx.current, h.width, h.height));
                 p.refs[i] = dims(w, hh);
             }
         }
@@ -181,7 +218,9 @@ impl Vp9Decoder {
             // vp9_decodeframe.c:1584-1590): every reference must satisfy it for
             // the engine, which has no per-ref scale fallback here.
             for i in 0..3 {
-                let (rw, rh) = self.st.slot_size(h.ref_frame_idx[i]);
+                let (_, rw, rh) = self.reference(h.ref_frame_idx[i]).ok_or_else(|| {
+                    VideoError::Invalid("VP9: missing active VA reference".into())
+                })?;
                 if 2 * h.width < rw || 2 * h.height < rh || h.width > 16 * rw || h.height > 16 * rh
                 {
                     return Err(VideoError::Unsupported(format!(
@@ -349,7 +388,45 @@ impl CodecDecoder for Vp9Decoder {
         if frame.len() == 1 && frame[0] == 0 {
             return self.next_job(); // libvpx skips 1-byte zero frames
         }
-        let h = self.st.parse(&frame).map_err(bitstream_error)?;
+        let mut h = self.st.parse(&frame).map_err(bitstream_error)?;
+        if let Some(p) = &self.va_picture {
+            if h.show_existing_frame {
+                return Err(VideoError::Unsupported("VP9 VA show_existing_frame has no coded picture".into()));
+            }
+            if (h.width, h.height) != (p.width, p.height)
+                || h.uncompressed_size != p.uncompressed_size || h.header_size != p.header_size
+            {
+                return Err(VideoError::Invalid("VP9 VA dimensions/header lengths disagree with frame".into()));
+            }
+            let f = p.fields;
+            h.frame_type = (f >> 2) & 1;
+            h.show_frame = f & (1 << 3) != 0;
+            h.error_resilient = f & (1 << 4) != 0;
+            h.intra_only = f & (1 << 5) != 0;
+            h.allow_high_precision_mv = f & (1 << 6) != 0;
+            h.interp_filter = ((f >> 7) & 7) as u8;
+            h.frame_parallel = f & (1 << 10) != 0;
+            h.reset_frame_context = (f >> 11) & 3;
+            h.refresh_frame_context = f & (1 << 13) != 0;
+            h.frame_context_idx = ((f >> 14) & 3) as usize;
+            h.ref_frame_idx = [((f >> 19) & 7) as usize, ((f >> 23) & 7) as usize, ((f >> 27) & 7) as usize];
+            h.sign_bias = [0, ((f >> 22) & 1) as u8, ((f >> 26) & 1) as u8, ((f >> 30) & 1) as u8];
+            h.lossless = f & (1 << 31) != 0;
+            h.filter_level = p.filter_level;
+            h.sharpness = p.sharpness;
+            h.log2_tile_cols = p.tile_cols;
+            h.log2_tile_rows = p.tile_rows;
+            self.st.seg.enabled = f & (1 << 16) != 0;
+            self.st.seg.temporal_update = f & (1 << 17) != 0;
+            self.st.seg.update_map = f & (1 << 18) != 0;
+            self.st.seg.tree_probs = p.tree_probs;
+            self.st.seg.pred_probs = p.pred_probs;
+            for (i, flags) in p.segment_flags.iter().enumerate() {
+                self.st.seg.feature_enabled[i][2] = flags & 1 != 0;
+                self.st.seg.feature_data[i][2] = ((flags >> 1) & 3) as i16;
+                self.st.seg.feature_enabled[i][3] = flags & 8 != 0;
+            }
+        }
         if self.st.bit_depth != self.bit_depth {
             return Err(VideoError::Unsupported(format!(
                 "VP9 {}-bit frame in a {}-bit session",
@@ -396,7 +473,7 @@ impl CodecDecoder for Vp9Decoder {
             .to_vec();
         let readback = (!h.error_resilient && !h.frame_parallel)
             .then(|| COUNTS..COUNTS + std::mem::size_of::<Vp9EntropyCounts>());
-        let show = h.show_frame;
+        let show = self.va_picture.is_some() || h.show_frame;
         // stream_len is the whole frame (stock), the engine reads from the
         // first tile (frameTagSize + offsetToDctParts).
         let job = DecodeJob {
@@ -450,7 +527,7 @@ impl CodecDecoder for Vp9Decoder {
             let si = if h.frame_type == KEY_FRAME {
                 cur
             } else {
-                self.st.slot_surface(h.ref_frame_idx[i]).unwrap_or(cur)
+                self.reference(h.ref_frame_idx[i]).map(|r| r.0).unwrap_or(cur)
             };
             r(&mut w, 0x430 + 4 * i as u32, s(si).luma);
             r(&mut w, 0x474 + 4 * i as u32, s(si).chroma);
@@ -509,7 +586,10 @@ impl CodecDecoder for Vp9Decoder {
             .map_err(bitstream_error)
     }
     fn referenced(&self) -> Vec<usize> {
-        self.st.referenced().collect()
+        match &self.va_picture {
+            Some(p) => p.references.iter().flatten().map(|r| r.0).collect(),
+            None => self.st.referenced().collect(),
+        }
     }
     fn flush(&mut self) {
         let max = self.max;
@@ -527,6 +607,48 @@ impl CodecDecoder for Vp9Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn va_references_override_parser_slots() {
+        let mut d = Vp9Decoder::new(0xc9b0, 640, 480, 8);
+        let mut p = VaPicture::default();
+        p.references[3] = Some((19, 320, 240));
+        d.set_va_picture(p);
+        assert_eq!(d.reference(3), Some((19, 320, 240)));
+        assert_eq!(d.reference(0), None);
+        assert_eq!(d.referenced(), vec![19]);
+    }
+
+    #[test]
+    fn va_hidden_picture_still_produces_output() {
+        let ivf = include_bytes!("testdata/vp9_160x144.ivf");
+        let frames = crate::vp9::ivf_frames(ivf).unwrap();
+        let mut frame = frames[0].to_vec();
+        frame[0] &= !2; // profile 0 key frame, show_frame = 0
+        let mut st = Vp9State::default();
+        let h = st.parse(&frame).unwrap();
+        assert!(!h.show_frame);
+        let mut d = Vp9Decoder::new(0xc9b0, 160, 144, 8);
+        d.set_va_picture(VaPicture {
+            width: h.width, height: h.height,
+            fields: 3 | (u32::from(h.error_resilient) << 4)
+                | (u32::from(h.frame_parallel) << 10)
+                | (u32::from(h.refresh_frame_context) << 13)
+                | ((h.frame_context_idx as u32) << 14)
+                | (u32::from(h.lossless) << 31),
+            filter_level: h.filter_level, sharpness: h.sharpness,
+            tile_cols: h.log2_tile_cols, tile_rows: h.log2_tile_rows,
+            uncompressed_size: h.uncompressed_size, header_size: h.header_size,
+            tree_probs: st.seg.tree_probs, pred_probs: st.seg.pred_probs,
+            ..Default::default()
+        });
+        d.push_unit(&frame).unwrap();
+        match d.next_job().unwrap().unwrap() {
+            Job::Decode(job) => assert!(job.show),
+            _ => panic!("hidden VA frame must decode"),
+        }
+        assert!(d.next_job().unwrap().is_none());
+    }
+
     #[test]
     fn stock_derived_fields() {
         // Stock: 1080p gptimer 81.6e6, 4K 324e6; ext_108 widths.

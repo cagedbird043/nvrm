@@ -151,6 +151,25 @@ impl Av1Decoder {
             None => self.cdf + (idx * CDF_BUFFER_SIZE) as u64,
         }
     }
+    /// Stage a client-parsed picture for the existing allocation/command machinery.
+    /// Each reference is (codec DPB slot, session surface).
+    pub fn build_picture(
+        &mut self,
+        seq: super::header::SequenceHeader,
+        hdr: super::header::FrameHeader,
+        bitstream: Vec<u8>,
+        tiles: Vec<super::header::TileRange>,
+        references: [Option<(usize, usize)>; 8],
+    ) -> VResult<usize> {
+        let j = self.c.build_picture(seq, hdr, bitstream, tiles,
+            references.map(|r| r.map(|r| r.0))).map_err(err)?;
+        for (slot, surface) in references.into_iter().flatten() {
+            self.slot_surface[slot] = Some(Surf::Session(surface));
+        }
+        let slot = j.slot;
+        self.current = Some(Box::new(j));
+        Ok(slot)
+    }
 }
 
 /// Count the frames a temporal unit decodes (OBU_FRAME / OBU_FRAME_HEADER without show_existing_frame).

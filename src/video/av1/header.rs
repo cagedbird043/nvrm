@@ -1194,7 +1194,7 @@ impl ParserState {
         Ok(())
     }
 
-    fn skip_mode_allowed(&self, seq: &SequenceHeader, h: &mut FrameHeader) -> bool {
+    pub(super) fn skip_mode_allowed(&self, seq: &SequenceHeader, h: &mut FrameHeader) -> bool {
         if h.frame_is_intra || !h.reference_select || !seq.enable_order_hint {
             return false;
         }

@@ -141,30 +141,24 @@ pub(crate) fn bitstream<T>(m: impl Into<String>) -> VResult<T> {
     Err(VideoError::Bitstream(m.into()))
 }
 
-/// NVDEC classes, newest first: (class, chip family, stock capability bit, tested on hardware by this
-/// library). The bit is the generation bit stock libnvcuvid 615.71.09 sets in its decoder capability word
-/// for that class (ELF 0x30970); every per-generation branch below tests that word with the masks of [`NvdecGen`]. Classes
-/// with bit 0 (Volta and older) decode nothing in stock and are refused here too. CFB0 (GB202, local + rental),
+/// NVDEC classes, newest first: (class, chip family, stock capability bit). The bit is the generation bit
+/// stock libnvcuvid 615.71.09 sets in its decoder capability word for that class (ELF 0x30970); every
+/// per-generation branch below tests that word with the masks of [`NvdecGen`]. Classes with bit 0 (Volta and
+/// older) decode nothing in stock and are refused here too. Every Turing+ class is enabled; CFB0 (GB202),
 /// C9B0 (AD107), C7B0 (GA106) and C4B0 (TU116) ran this library's decoder bit-exact against stock and FFmpeg
-/// (rental run 20261015-nvdec-xgen3); the rest are refused unless `NV_VIDEO_UNTESTED_CLASSES=1`
-/// ([`untested_classes_allowed`]).
-pub const NVDEC_CLASSES: [(u32, &str, u32, bool); 11] = [
-    (0xd2b0, "Rubin GR10x", 0x0200_0000, false),
-    (0xceb0, "Blackwell GB10B/GB10C", 0x0100_0000, false),
-    (0xcfb0, "Blackwell GB20x", 0x0080_0000, true),
-    (0xd1b0, "Blackwell GB20B/GB20C", 0x0040_0000, false),
-    (
-        0xcdb0,
-        "Blackwell GB10x/GB11x (data centre)",
-        0x0020_0000,
-        false,
-    ),
-    (0xc9b0, "Ada AD10x", 0x0010_0000, true),
-    (0xc7b0, "Ampere GA10x", 0x0008_0000, true),
-    (0xb8b0, "Hopper GH100", 0x0004_0000, false),
-    (0xc6b0, "Ampere GA100", 0x0002_0000, false),
-    (0xc4b0, "Turing", 0x0001_0000, true),
-    (0xc3b0, "Volta", 0, false),
+/// (rental run 20261015-nvdec-xgen3), the others follow the same stock gates unmeasured.
+pub const NVDEC_CLASSES: [(u32, &str, u32); 11] = [
+    (0xd2b0, "Rubin GR10x", 0x0200_0000),
+    (0xceb0, "Blackwell GB10B/GB10C", 0x0100_0000),
+    (0xcfb0, "Blackwell GB20x", 0x0080_0000),
+    (0xd1b0, "Blackwell GB20B/GB20C", 0x0040_0000),
+    (0xcdb0, "Blackwell GB10x/GB11x (data centre)", 0x0020_0000),
+    (0xc9b0, "Ada AD10x", 0x0010_0000),
+    (0xc7b0, "Ampere GA10x", 0x0008_0000),
+    (0xb8b0, "Hopper GH100", 0x0004_0000),
+    (0xc6b0, "Ampere GA100", 0x0002_0000),
+    (0xc4b0, "Turing", 0x0001_0000),
+    (0xc3b0, "Volta", 0),
 ];
 
 /// Per-generation gates of one NVDEC class: the stock capability bit of [`NVDEC_CLASSES`] tested with the
@@ -209,23 +203,6 @@ impl NvdecGen {
     pub fn d1b0(self) -> bool {
         self.bit & 0x0040_0000 != 0
     }
-}
-
-/// Explicit verification opt-in `NV_VIDEO_UNTESTED_CLASSES=1`: NVDEC classes this library never ran on
-/// hardware are accepted (cross-generation bit-exactness runs on rented GPUs). Announced once on stderr;
-/// never set in production.
-pub fn untested_classes_allowed() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("NV_VIDEO_UNTESTED_CLASSES").is_ok_and(|v| v == "1");
-        if on {
-            eprintln!(
-                "nv_video: NV_VIDEO_UNTESTED_CLASSES=1: NVDEC classes never run by this library are \
-                 enabled (verification only, outputs unverified)"
-            );
-        }
-        on
-    })
 }
 
 /// Append one buffer-address method the way stock's relocation emitter encodes it (ELF
@@ -554,14 +531,9 @@ impl NvdecEngineCaps {
 /// 0x2c520) intersected with what this library implements (8-bit H.264
 /// 4:2:0 up to 4096², HEVC Main/Main 10, VP9 profiles 0/2, AV1 Main 8/10-bit). `engine` is the BSP caps of
 /// the engine sessions submit to (NVDEC0): stock asks whether *any* present engine qualifies (0x2c420,
-/// 0x2c470); this library drives NVDEC0 only, so it asks that engine. `supported` also needs a class this
-/// library ran on hardware, or the `NV_VIDEO_UNTESTED_CLASSES=1` opt-in.
+/// 0x2c470); this library drives NVDEC0 only, so it asks that engine.
 pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
     let g = NvdecGen::of(class);
-    let tested = NVDEC_CLASSES
-        .iter()
-        .find(|c| c.0 == class)
-        .is_some_and(|c| c.3 || untested_classes_allowed());
     let mut c = NvVideoCaps {
         codec,
         ..Default::default()
@@ -603,7 +575,7 @@ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
         }
         _ => stock = false,
     }
-    c.supported = u32::from(stock && tested);
+    c.supported = u32::from(stock);
     c
 }
 

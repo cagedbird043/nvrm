@@ -306,7 +306,6 @@ impl Session {
         }
         let caps = super::caps(info.codec, class, &dev.engine0);
         if caps.supported == 0 {
-            let known = super::NVDEC_CLASSES.iter().find(|c| c.0 == class);
             let why = if let Some(gap) = super::class_gap(info.codec, class) {
                 gap.to_string()
             } else if !NvdecGen::of(class).turing_plus() {
@@ -317,12 +316,8 @@ impl Session {
             } else if info.codec == super::CODEC_AV1 && !NvdecGen::of(class).ga10x_plus() {
                 "NVDEC AV1 needs GA10x or newer (stock: Turing, GA100 and Hopper have none)"
                     .to_string()
-            } else if known.is_some_and(|c| !c.3) {
-                "this NVDEC class never ran this library's decoder; set NV_VIDEO_UNTESTED_CLASSES=1 \
-                 only to verify it"
-                    .to_string()
             } else {
-                "unknown NVDEC class".to_string()
+                "codec not implemented by this library".to_string()
             };
             return Err(VideoError::Unsupported(format!(
                 "codec {} on NVDEC class {class:#x}: {why}",

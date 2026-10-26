@@ -422,11 +422,9 @@ fn caps_per_generation() {
     // D1B0: extra setup word not reproduced → refused with a reason.
     assert!(class_gap(CODEC_HEVC, 0xd1b0).is_some() && class_gap(CODEC_AV1, 0xd1b0).is_none());
     assert!(ok(CODEC_HEVC, 0xc4b0));
-    // Classes verified on hardware (CFB0/C9B0/C7B0/C4B0) are enabled without the opt-in; GA100 is not.
-    if !super::untested_classes_allowed() {
-        for class in [0xcfb0, 0xc9b0, 0xc7b0, 0xc4b0] {
-            assert_eq!(caps(CODEC_HEVC, class).supported, 1, "{class:#x}");
-        }
-        assert_eq!(caps(CODEC_HEVC, 0xc6b0).supported, 0);
+    // Every Turing+ class decodes without an opt-in, measured on hardware or not; GA100 has no AV1.
+    for class in [0xd2b0, 0xceb0, 0xcfb0, 0xcdb0, 0xc9b0, 0xc7b0, 0xb8b0, 0xc6b0, 0xc4b0] {
+        assert_eq!(caps(CODEC_HEVC, class).supported, 1, "{class:#x}");
     }
+    assert_eq!(caps(CODEC_AV1, 0xc6b0).supported, 0);
 }

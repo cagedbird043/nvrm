@@ -15,16 +15,22 @@ re-passes the previous release fence as the acquire fence and times the copy_out
 
 Rust 调用方可用 `Session::with_codec` 注入 `CodecDecoder`，由客户端提供已经解析的
 图像参数，复用会话的显存、提交、同步与 copy-out。原有 `Session::new` 和 C ABI 仍接收码流。
-`h264::codec::H264Decoder::build_picture` 复用硬件方法及辅助缓冲区，
-`h264::desc::initial_lists` 供两种前端共用参考列表初始化规则。
+各格式的参数入口复用硬件方法及辅助缓冲区：
+
+| 格式 | 入口 |
+|---|---|
+| H.264 | `h264::codec::H264Decoder::build_picture`；`h264::desc::initial_lists` 供两种前端共用参考列表初始化规则 |
+| HEVC | `hevc::codec::HevcDecoder::build_picture`，`session_inputs` 给出会话需要分配的辅助缓冲区布局 |
+| VP9 | `vp9::Vp9Decoder::set_va_picture` 绑定 VA 参考后，由 RM 解析随后提交的整帧数据 |
+| AV1 | `av1::Av1Codec::build_picture`（参考由客户端的参考表给出）与 `av1::codec::Av1Decoder::build_picture` |
 
 `Session::wait_picture` 等待硬件并检查状态；`copy_out_wait` 同步完成输出拷贝。
 `OutputAllocator` 独立于解码会话分配和清零 PRIME 输出显存，使 VA surface 在解码前就能导出，
 且在后续解码时保持相同 backing。调用方必须在消费者读完之后才复用输出；RM 对象仍由所属线程持有。
 
 工作区 `nvidia/vaapi-rust` 提供该前端与硬件回归脚本。2026-10-26 在 RTX 4060 Laptop / 615.78.08
-验证了 Baseline/Main/High 共 666 帧与软件解码逐字节一致，以及 mpv 的 Wayland/EGL 显示。
-原有原生 H.264 码流路径另外通过 60 帧逐字节比对。以上不代表其它 GPU 或驱动版本已验证。
+验证了 H.264、HEVC Main、VP9 Profile 0、AV1 Profile 0 共 9 个样本、1674 帧与软件解码逐字节一致，
+以及 mpv、Firefox、Chrome 的显示。以上不代表其它 GPU 或驱动版本已验证。
 
 ## Layers
 

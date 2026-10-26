@@ -19,6 +19,10 @@
 //! widened for `-10`), `-bf N`, `-refs N`, `-depth N`, `-slices N`, `-aq N`,
 //! `-quality`, `-two-pass`, `-lossless`, `-no-cu8`, `-vbv KBITS`, `-maxrate KBPS`,
 //! `-colour P T M`, `-mdcv HEX48`, `-cll HEX8`, `-full-range`, and `-pci BDF`.
+//!
+//! `EncConfig::min_qp` / `max_qp` optionally constrain native RC quantizers
+//! (H.264/HEVC 0..51, AV1 0..255), through the driver's per-picture minQP/maxQP
+//! arrays. Both default to `None`, retaining the original C core's setup bytes.
 pub mod av1hdr;
 pub mod av1probs;
 mod av1tables;

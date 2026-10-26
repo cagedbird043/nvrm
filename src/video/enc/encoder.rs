@@ -35,6 +35,10 @@ pub struct EncConfig {
     pub height: i32,
     pub qp_i: i32,
     pub qp_p: i32,
+    /// Optional native quantizer bounds (H.264/HEVC 0..51, AV1 0..255).
+    /// None preserves the mickys setup bytes, including HEVC's signed ten-bit minimum.
+    pub min_qp: Option<u8>,
+    pub max_qp: Option<u8>,
     pub num_refs: i32,
     pub dpb_extra: i32,
     pub engine: i32,
@@ -866,6 +870,17 @@ impl Encoder {
         let qb = (c.qp_p + 2).min(51);
         r.QP = [c.qp_p as u8, qb as u8, c.qp_i as u8];
         r.maxQP = [51; 3];
+        if let Some(q) = c.min_qp {
+            r.minQP = [q.min(51); 3];
+        }
+        if let Some(q) = c.max_qp {
+            r.maxQP = [q.min(51).max(c.min_qp.unwrap_or(0).min(51)); 3];
+        }
+        if c.min_qp.is_some() || c.max_qp.is_some() {
+            for q in &mut r.QP {
+                *q = (*q).clamp(r.minQP[0], r.maxQP[0]);
+            }
+        }
         r.rhopbi = [256; 3];
         r.framerate = c.fps;
         r.gop_length = u32::MAX;
@@ -1102,6 +1117,17 @@ impl Encoder {
         r.QP = [c.qp_p as u8, qb as u8, c.qp_i as u8];
         r.minQP = [if c.bit_depth > 8 { 244 } else { 0 }; 3];
         r.maxQP = [51; 3];
+        if let Some(q) = c.min_qp {
+            r.minQP = [q.min(51); 3];
+        }
+        if let Some(q) = c.max_qp {
+            r.maxQP = [q.min(51).max(c.min_qp.unwrap_or(0).min(51)); 3];
+        }
+        if c.min_qp.is_some() || c.max_qp.is_some() {
+            for q in &mut r.QP {
+                *q = (*q).clamp(c.min_qp.unwrap_or(0).min(51), r.maxQP[0]);
+            }
+        }
         r.rhopbi = [256; 3];
         r.framerate = c.fps;
         r.gop_length = if c.idr_period > 0 {
@@ -1472,6 +1498,17 @@ impl Encoder {
             r.hrd_type = 2;
             r.QP = [c.qp_p as u8, (c.qp_p + 16).min(255) as u8, c.qp_i as u8];
             r.maxQP = [255; 3];
+            if let Some(q) = c.min_qp {
+                r.minQP = [q; 3];
+            }
+            if let Some(q) = c.max_qp {
+                r.maxQP = [q.max(c.min_qp.unwrap_or(0)); 3];
+            }
+            if c.min_qp.is_some() || c.max_qp.is_some() {
+                for q in &mut r.QP {
+                    *q = (*q).clamp(r.minQP[0], r.maxQP[0]);
+                }
+            }
             r.maxQPD = 32;
             r.baseQPD = 16;
             r.rhopbi = if vbr {

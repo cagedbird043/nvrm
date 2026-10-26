@@ -17,7 +17,7 @@ use super::{
     hdr::HdrStaticMetadata,
     open_render_node, open_rm, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen,
     PictureInfo, SurfaceLayout, SurfaceRef, VResult, VideoDevice, VideoError, FORMAT_NV12,
-    FORMAT_P010, FORMAT_YUV420P,
+    FORMAT_P010, FORMAT_P016, FORMAT_YUV420P, FORMAT_YUV444P, FORMAT_YUV444P16,
 };
 use crate::{
     events::RmEvents,
@@ -304,7 +304,11 @@ impl Session {
         if class == 0 {
             return Err(VideoError::Unsupported("GPU exposes no NVDEC class".into()));
         }
-        let caps = super::caps(info.codec, class, &dev.engine0);
+        let caps = if custom.is_some() {
+            super::external_caps(info.codec, class, &dev.engine0)
+        } else {
+            super::caps(info.codec, class, &dev.engine0)
+        };
         if caps.supported == 0 {
             let why = if let Some(gap) = super::class_gap(info.codec, class) {
                 gap.to_string()
@@ -773,27 +777,10 @@ impl Session {
             self.nvdec.wait(&self.drm, decoded_at)?;
         }
         self.poll_status()?;
-        // The engine writes 10-bit pictures in 16-bit containers with the sample in the 10 MSBs
+        // The engine writes 10/12-bit pictures in 16-bit containers with the sample in the MSBs
         // (P010 bit layout, measured: the copy of the engine surface is bit-exact against FFmpeg's
-        // p010le), so P010 is a plain copy like NV12; no depth conversion in either direction.
-        let bps =
-            match (t.format, info.bit_depth) {
-                (FORMAT_NV12 | FORMAT_YUV420P, 8) => 1u32,
-                (FORMAT_P010, 10) => 2u32,
-                (FORMAT_YUV420P, d) => {
-                    return Err(VideoError::Unsupported(format!(
-                        "planar YUV 4:2:0 target for a {d}-bit picture (8-bit only)"
-                    )))
-                }
-                (FORMAT_NV12 | FORMAT_P010, d) => {
-                    return Err(VideoError::Unsupported(format!(
-                    "{} target for a {d}-bit picture (NV12 carries 8-bit, P010 10-bit pictures; \
-                     the copy engine does not convert depth)",
-                    if t.format == FORMAT_NV12 { "NV12" } else { "P010" }
-                )))
-                }
-                (f, _) => return Err(VideoError::Invalid(format!("unknown target format {f}"))),
-            };
+        // p010le), so P010/P016 are plain copies like NV12; no depth conversion in either direction.
+        let bps = target_bytes_per_sample(t.format, info.bit_depth, self.layout.chroma_444)?;
         if bps != self.layout.bytes_per_sample {
             return Err(VideoError::Invalid(format!(
                 "{}-bit picture on {}-byte engine surfaces",
@@ -836,7 +823,7 @@ impl Session {
                 }
             }
             let (mem, va) = &imports[import_of[p]];
-            let rows = if p == 0 { ch } else { ch.div_ceil(2) };
+            let rows = if p == 0 || dst.chroma_full { ch } else { ch.div_ceil(2) };
             let need = t.offset[p] + dst.plane_bytes(p, rows, cw, bps);
             if need > mem.size as u64 {
                 return Err(VideoError::Invalid(format!(
@@ -869,18 +856,20 @@ impl Session {
             // X dimensions (source width, origin, line length) count elements of
             // NUM_SRC_COMPONENTS * COMPONENT_SIZE bytes, pitches stay in bytes, as NVK's
             // nouveau_copy_rect programs them (Mesa 26.2.5 nvk_cmd_copy.c:195-215, 257, 286, 296,
-            // 368). Element = one CbCr pair (2 x 1 byte); Cb is component X, Cr component Y.
+            // 368). Element = one CbCr pair (2 x bps bytes); Cb is component X, Cr component Y.
+            // 4:4:4 keeps every chroma row and column; 4:2:0 halves both.
             let remap = (p > 0 && planes == 3).then_some(if p == 1 { 0u32 } else { 1u32 });
+            let step = if dst.chroma_full { 1 } else { 2 };
             let (src_va, rows_alloc, rows, line_bytes, ox, oy) = if p == 0 {
                 (src.luma, self.layout.luma_rows, ch, cw * bps, cl * bps, ct)
             } else if remap.is_some() {
                 (
                     src.chroma,
                     self.layout.chroma_rows,
-                    ch.div_ceil(2),
-                    cw.div_ceil(2),
-                    cl / 2,
-                    ct / 2,
+                    ch.div_ceil(step),
+                    cw.div_ceil(step),
+                    cl / step,
+                    ct / step,
                 )
             } else {
                 (
@@ -893,9 +882,11 @@ impl Session {
                 )
             };
             let src_width = if remap.is_some() {
-                self.layout.pitch / 2
-            } else {
+                self.layout.chroma_pitch / (2 * bps)
+            } else if p == 0 {
                 self.layout.pitch
+            } else {
+                self.layout.chroma_pitch
             };
             // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
             let gob_kind = if blackwell_ce {
@@ -914,7 +905,7 @@ impl Session {
                     &mut w,
                     4,
                     0x708,
-                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | 1 << 20],
+                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 20],
                 );
                 launch |= 1 << 10; // REMAP_ENABLE
             }
@@ -932,7 +923,8 @@ impl Session {
                         &mut w,
                         4,
                         0x710,
-                        &[dst.pitch[p], dst_rows, 1, 0],
+                        // With remapping X counts destination elements (one component of `bps` bytes).
+                        &[if remap.is_some() { dst.pitch[p] / bps } else { dst.pitch[p] }, dst_rows, 1, 0],
                     );
                     method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
                 }
@@ -944,7 +936,12 @@ impl Session {
                 &mut w,
                 4,
                 0x410,
-                &[self.layout.pitch, t.pitch[p], line_bytes, rows],
+                &[
+                    if p == 0 { self.layout.pitch } else { self.layout.chroma_pitch },
+                    t.pitch[p],
+                    line_bytes,
+                    rows,
+                ],
             );
             method(&mut w, 4, 0x300, &[launch]);
         }
@@ -1121,14 +1118,47 @@ pub struct Target {
     pub acquire_fence_fd: i32,
 }
 
+/// Bytes per sample of the destination format for a picture of `depth` bits from 4:2:0 or 4:4:4
+/// engine surfaces; the copy engine does not convert depth or chroma format.
+fn target_bytes_per_sample(format: u32, depth: u32, chroma_444: bool) -> VResult<u32> {
+    let name = |f: u32| match f {
+        FORMAT_NV12 => "NV12",
+        FORMAT_P010 => "P010",
+        FORMAT_YUV420P => "planar YUV 4:2:0",
+        FORMAT_P016 => "P016",
+        FORMAT_YUV444P => "planar YUV 4:4:4",
+        _ => "planar YUV 4:4:4 (16-bit)",
+    };
+    let (bps, matches) = match format {
+        FORMAT_NV12 | FORMAT_YUV420P => (1, depth == 8 && !chroma_444),
+        FORMAT_P010 => (2, depth == 10 && !chroma_444),
+        FORMAT_P016 => (2, depth > 8 && !chroma_444),
+        FORMAT_YUV444P => (1, depth == 8 && chroma_444),
+        FORMAT_YUV444P16 => (2, depth > 8 && chroma_444),
+        f => return Err(VideoError::Invalid(format!("unknown target format {f}"))),
+    };
+    if matches {
+        Ok(bps)
+    } else {
+        Err(VideoError::Unsupported(format!(
+            "{} target for a {depth}-bit {} picture (the copy engine does not convert depth or \
+             chroma format)",
+            name(format),
+            if chroma_444 { "4:4:4" } else { "4:2:0" }
+        )))
+    }
+}
+
 /// Decoded destination layout: pitch, or block linear with log2 block height
 /// and per-plane copy-engine GOB kinds.
 #[derive(Debug)]
 struct TargetLayout {
     block: Option<(u32, [u32; 2])>,
     pitch: [u32; 3],
-    /// Y + Cb + Cr planes (planar 4:2:0) instead of Y + CbCr.
+    /// Y + Cb + Cr planes (planar 4:2:0 or 4:4:4) instead of Y + CbCr.
     planar: bool,
+    /// Chroma planes have the luma height (4:4:4).
+    chroma_full: bool,
 }
 
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -1138,8 +1168,9 @@ impl TargetLayout {
     /// DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h) (drm_fourcc.h):
     /// 0x10 | h[3:0] | k[19:12] | g[21:20] | s[22] | c[25:23].
     fn parse(t: &Target, copy_class: u32, bytes_per_sample: u32) -> VResult<Self> {
-        let planar = t.format == FORMAT_YUV420P;
-        if planar && t.modifier != DRM_FORMAT_MOD_LINEAR {
+        let planar = matches!(t.format, FORMAT_YUV420P | FORMAT_YUV444P | FORMAT_YUV444P16);
+        let chroma_full = matches!(t.format, FORMAT_YUV444P | FORMAT_YUV444P16);
+        if t.format == FORMAT_YUV420P && t.modifier != DRM_FORMAT_MOD_LINEAR {
             return Err(VideoError::Unsupported(format!(
                 "planar YUV 4:2:0 target with modifier {:#x} (LINEAR only)",
                 t.modifier
@@ -1158,19 +1189,8 @@ impl TargetLayout {
                 block: None,
                 pitch: t.pitch,
                 planar,
+                chroma_full,
             });
-        }
-        // The 2-byte-sample (P010) block-linear destination write is derived, not measured:
-        // the destination GOB layout the copy engine produces for 16-bit luma / 32-bit CbCr
-        // has never been read back and compared on hardware. Refuse it rather than write a
-        // possibly wrong layout; LINEAR P010 is bit-exact (host test) and NV12 block-linear
-        // (1-byte samples) is measured.
-        if bytes_per_sample != 1 {
-            return Err(VideoError::Unsupported(format!(
-                "P010 block-linear target (modifier {:#x}): the copy engine's 16-bit \
-                 block-linear write is not verified end to end; use a LINEAR P010 target",
-                t.modifier
-            )));
         }
         let v = t.modifier & ((1 << 56) - 1);
         if t.modifier >> 56 != VENDOR_NVIDIA || v & 0x10 == 0 || v >> 26 != 0 {
@@ -1188,12 +1208,24 @@ impl TargetLayout {
                 t.modifier
             )));
         }
-        // g = 3: Blackwell GOBs whose layout depends on bytes per element:
-        // NV12 luma 1 B -> GOB_KIND_8, CbCr 2 B -> GOB_KIND_16; P010 luma 2 B -> GOB_KIND_16,
-        // CbCr 4 B -> GOB_KIND_32 (0), the same per-plane kinds the engine writes.
+        // g = 2 (Turing..Ada GOBs): the 64 x 8 byte GOB layout does not depend on the element size,
+        // so 16-bit planes copy like 8-bit ones (verified end to end through a Vulkan import for
+        // P010 and planar 4:4:4 targets, see vaapi-rust/tests/dmabuf_egl.c).
+        // g = 3: Blackwell GOBs whose layout depends on bytes per element: NV12 luma 1 B ->
+        // GOB_KIND_8, CbCr 2 B -> GOB_KIND_16; the 16-bit and planar combinations were never
+        // read back on hardware, so they are refused rather than written as a guess.
         let kinds = match g {
-            3 if copy_class >= 0xc9b5 => super::blackwell_gob_kinds(bytes_per_sample),
+            3 if copy_class >= 0xc9b5 && bytes_per_sample == 1 && !planar => {
+                super::blackwell_gob_kinds(bytes_per_sample)
+            }
             2 => [0, 0],
+            3 if copy_class >= 0xc9b5 => {
+                return Err(VideoError::Unsupported(format!(
+                    "modifier {:#x}: Blackwell block-linear writes are verified for NV12 only \
+                     (16-bit and planar targets: use g = 2 or LINEAR)",
+                    t.modifier
+                )))
+            }
             _ => {
                 return Err(VideoError::Unsupported(format!(
                     "modifier {:#x}: GOB generation {g} not writable by copy class {copy_class:#x}",
@@ -1201,8 +1233,12 @@ impl TargetLayout {
                 )))
             }
         };
-        for p in 0..2 {
-            let minimum = if p == 0 { t.width } else { t.width.div_ceil(2) * 2 };
+        for p in 0..if planar { 3 } else { 2 } {
+            let minimum = if p == 0 || planar {
+                t.width * bytes_per_sample
+            } else {
+                t.width.div_ceil(2) * 2 * bytes_per_sample
+            };
             if !t.pitch[p].is_multiple_of(64) || t.pitch[p] < minimum.next_multiple_of(64) {
                 return Err(VideoError::Invalid(format!("block-linear plane {p} pitch {} is not a sufficient 64-byte stride", t.pitch[p])));
             }
@@ -1210,7 +1246,8 @@ impl TargetLayout {
         Ok(Self {
             block: Some((h, kinds)),
             pitch: t.pitch,
-            planar: false,
+            planar,
+            chroma_full,
         })
     }
     fn planes(&self) -> usize {
@@ -1222,6 +1259,8 @@ impl TargetLayout {
     }
     fn plane_bytes(&self, p: usize, rows: u32, width: u32, bps: u32) -> u64 {
         let line = if p == 0 {
+            width * bps
+        } else if self.chroma_full {
             width * bps
         } else if self.planar {
             width.div_ceil(2) * bps
@@ -1263,17 +1302,13 @@ mod tests {
             .is_none());
         let t = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 1).unwrap();
         assert_eq!(t.block, Some((4, [1, 2])));
-        // P010 (2-byte samples) block-linear: verified end to end nowhere, refused with the
-        // reason on both GOB generations instead of writing a guessed layout.
-        for modif in [bl(0, 1, 3, 0xfe, 4), bl(0, 1, 2, 0xfe, 1)] {
-            let e = TargetLayout::parse(&target(modif), 0xcab5, 2).unwrap_err();
-            assert!(
-                e.message().contains("P010 block-linear") && e.message().contains("not verified"),
-                "{}",
-                e.message()
-            );
-            assert_eq!(e.code(), -2); // NV_VIDEO_E_UNSUPPORTED
-        }
+        // 16-bit and planar block-linear targets: written like 8-bit ones on Turing..Ada GOBs (g = 2),
+        // refused on Blackwell GOBs (g = 3), whose layout depends on the element size.
+        let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xcab5, 2).unwrap();
+        assert_eq!(t.block, Some((1, [0, 0])));
+        let e = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 2).unwrap_err();
+        assert!(e.message().contains("Blackwell"), "{}", e.message());
+        assert_eq!(e.code(), -2); // NV_VIDEO_E_UNSUPPORTED
         let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xc7b5, 1).unwrap();
         assert_eq!(t.block, Some((1, [0, 0])));
         assert_eq!(t.pitch, [256, 256, 0]);

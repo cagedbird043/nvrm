@@ -267,6 +267,23 @@ pub struct Sps {
     pub num_long_term_ref_pics_sps: u32,
     pub temporal_mvp: bool,
     pub strong_intra_smoothing: bool,
+    /// sps_range_extension (all false/0 for Main and Main 10).
+    pub rext: SpsRext,
+}
+/// Range-extension flags of the SPS the engine descriptor carries (nvdec_hevc_main10_444_ext_s).
+/// The Annex-B parser here rejects the extension; parameter-driven callers (VA-API) fill it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpsRext {
+    pub transform_skip_rotation: bool,
+    pub transform_skip_context: bool,
+    pub implicit_rdpcm: bool,
+    pub explicit_rdpcm: bool,
+    pub extended_precision: bool,
+    pub intra_smoothing_disabled: bool,
+    pub high_precision_offsets: bool,
+    /// persistent_rice_adaptation_enabled_flag (the descriptor's fastRiceAdaptationEnableFlag).
+    pub persistent_rice_adaptation: bool,
+    pub cabac_bypass_alignment: bool,
 }
 impl Sps {
     pub fn ctb_size(&self) -> u32 {
@@ -457,6 +474,7 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
         num_long_term_ref_pics_sps,
         temporal_mvp,
         strong_intra_smoothing,
+        rext: SpsRext::default(),
     })
 }
 
@@ -526,6 +544,38 @@ pub struct Pps {
     pub lists_modification_present: bool,
     pub log2_parallel_merge_level: u32,
     pub slice_header_extension_present: bool,
+    /// pps_range_extension (defaults for Main and Main 10).
+    pub rext: PpsRext,
+}
+/// Range-extension values of the PPS the engine descriptor carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PpsRext {
+    /// Log2MaxTransformSkipSize = log2_max_transform_skip_block_size_minus2 + 2 (2 without the extension).
+    pub log2_max_transform_skip_size: u32,
+    pub cross_component_prediction: bool,
+    pub chroma_qp_offset_list_enabled: bool,
+    pub diff_cu_chroma_qp_offset_depth: u32,
+    /// chroma_qp_offset_list_len_minus1 + 1 (1..=6 when the list is enabled).
+    pub chroma_qp_offset_list_len: u32,
+    pub log2_sao_offset_scale_luma: u32,
+    pub log2_sao_offset_scale_chroma: u32,
+    pub cb_qp_offset_list: [i8; 6],
+    pub cr_qp_offset_list: [i8; 6],
+}
+impl Default for PpsRext {
+    fn default() -> Self {
+        Self {
+            log2_max_transform_skip_size: 2,
+            cross_component_prediction: false,
+            chroma_qp_offset_list_enabled: false,
+            diff_cu_chroma_qp_offset_depth: 0,
+            chroma_qp_offset_list_len: 0,
+            log2_sao_offset_scale_luma: 0,
+            log2_sao_offset_scale_chroma: 0,
+            cb_qp_offset_list: [0; 6],
+            cr_qp_offset_list: [0; 6],
+        }
+    }
 }
 
 pub fn parse_pps(rbsp: &[u8]) -> VResult<Pps> {
@@ -642,5 +692,6 @@ pub fn parse_pps(rbsp: &[u8]) -> VResult<Pps> {
         lists_modification_present,
         log2_parallel_merge_level,
         slice_header_extension_present,
+        rext: PpsRext::default(),
     })
 }

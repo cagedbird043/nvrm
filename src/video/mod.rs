@@ -41,6 +41,12 @@ pub const CODEC_AV1: u32 = 4;
 pub const FORMAT_NV12: u32 = 1;
 pub const FORMAT_P010: u32 = 2;
 pub const FORMAT_YUV420P: u32 = 3;
+/// 4:2:0 in 16-bit containers, any depth above 8 (P010 for 10-bit, P012/P016 for 12-bit pictures).
+pub const FORMAT_P016: u32 = 4;
+/// Planar 4:4:4, 8-bit samples (three planes).
+pub const FORMAT_YUV444P: u32 = 5;
+/// Planar 4:4:4, 16-bit containers (three planes; Q416 for 10/12-bit pictures).
+pub const FORMAT_YUV444P16: u32 = 6;
 
 /// nv_video error classes (NvVideoError). Every variant carries the reason
 /// that nv_video_last_error() reports.
@@ -280,15 +286,33 @@ pub struct SurfaceLayout {
     pub size: usize,
     /// Bytes per luma sample (1 = 8-bit, 2 = 16-bit containers).
     pub bytes_per_sample: u32,
+    /// Bytes per row of the interleaved CbCr plane: the luma pitch for 4:2:0, twice it for 4:4:4.
+    pub chroma_pitch: u32,
+    /// 4:4:4: the CbCr plane has as many rows as the luma plane.
+    pub chroma_444: bool,
 }
 
 impl SurfaceLayout {
     pub fn new(max_width: u32, max_height: u32, bytes_per_sample: u32) -> Self {
+        Self::with_chroma(max_width, max_height, bytes_per_sample, false)
+    }
+
+    /// 4:4:4 engine surfaces: luma, then one interleaved CbCr plane of full height and twice the pitch.
+    pub fn new_444(max_width: u32, max_height: u32, bytes_per_sample: u32) -> Self {
+        Self::with_chroma(max_width, max_height, bytes_per_sample, true)
+    }
+
+    fn with_chroma(max_width: u32, max_height: u32, bytes_per_sample: u32, chroma_444: bool) -> Self {
         let pitch = (max_width * bytes_per_sample).next_multiple_of(64);
         let luma_rows = max_height.next_multiple_of(64);
-        let chroma_rows = max_height.div_ceil(2).next_multiple_of(64);
+        let chroma_rows = if chroma_444 {
+            luma_rows
+        } else {
+            max_height.div_ceil(2).next_multiple_of(64)
+        };
+        let chroma_pitch = if chroma_444 { 2 * pitch } else { pitch };
         let chroma_offset = u64::from(pitch) * u64::from(luma_rows);
-        let size = (chroma_offset as usize + pitch as usize * chroma_rows as usize)
+        let size = (chroma_offset as usize + chroma_pitch as usize * chroma_rows as usize)
             .next_multiple_of(1 << 16);
         Self {
             pitch,
@@ -297,6 +321,8 @@ impl SurfaceLayout {
             chroma_offset,
             size,
             bytes_per_sample,
+            chroma_pitch,
+            chroma_444,
         }
     }
 }
@@ -577,6 +603,24 @@ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
         _ => stock = false,
     }
     c.supported = u32::from(stock);
+    c
+}
+
+/// Capabilities of parameter-driven sessions ([`session::Session::with_codec`]): what [`caps`]
+/// reports plus the pictures whose parameters the caller supplies, so the library's Annex-B parsers
+/// need not read the extension syntax. HEVC adds the range-extension profiles (12-bit and 4:4:4,
+/// stock: every Turing+ class), VP9 profile 2 adds 12-bit when the engine decodes high bit depth.
+/// AV1 and H.264 are unchanged (stock has no AV1 4:4:4 and this library no H.264 above 8 bits).
+pub fn external_caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
+    let mut c = caps(codec, class, engine);
+    match codec {
+        CODEC_HEVC => {
+            c.bit_depth_mask |= 1 << 12;
+            c.chroma_420_only = 0;
+        }
+        CODEC_VP9 if engine.vp9_high_bit_depth => c.bit_depth_mask |= 1 << 12,
+        _ => (),
+    }
     c
 }
 

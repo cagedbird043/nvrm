@@ -382,9 +382,10 @@ pub fn build(
     )?;
     put32(&mut d, 0xd4, b.0);
     put32(&mut d, 0xd8, st.num_bits_st_rps);
-    // v1 main10_444 pps word: log2MaxTransformSkipSize = log2_max_transform_skip_block_size_minus2 + 2
-    // (= 2 without the range extension; stock writes (old & 0xfffe07f0) | 2).
-    put32(&mut d, 0xe0, 2);
+    // v1 nvdec_hevc_main10_444_ext_s (0xdc..0xf0): SPS range-extension flags, then the PPS word whose
+    // log2MaxTransformSkipSize is 2 without the extension (stock writes (old & 0xfffe07f0) | 2),
+    // then the chroma QP offset lists. Stock's 4:4:4 captures leave every flag 0 (x265 streams).
+    write_range_extension(&mut d, sps, pps)?;
     put32(&mut d, 0xf0, si.filter.flt_above);
     put32(&mut d, 0xf4, si.filter.sao_above);
     // v3: slice_ec_mv_type = 1 (co-located), slice_ec_slice_type bit 5 for pictures without refs.
@@ -427,6 +428,40 @@ pub fn build(
         }
     }
     Ok(d)
+}
+
+fn write_range_extension(d: &mut [u8], sps: &Sps, pps: &Pps) -> VResult<()> {
+    let e = &sps.rext;
+    let mut b = Bits(0);
+    for (shift, flag, name) in [
+        (0, e.transform_skip_rotation, "transform_skip_rotation_enabled_flag"),
+        (1, e.transform_skip_context, "transform_skip_context_enabled_flag"),
+        (3, e.implicit_rdpcm, "implicit_rdpcm_enabled_flag"),
+        (4, e.explicit_rdpcm, "explicit_rdpcm_enabled_flag"),
+        (5, e.extended_precision, "extended_precision_processing_flag"),
+        (6, e.intra_smoothing_disabled, "intra_smoothing_disabled_flag"),
+        (7, e.high_precision_offsets, "high_precision_offsets_enabled_flag"),
+        (8, e.persistent_rice_adaptation, "persistent_rice_adaptation_enabled_flag"),
+        (9, e.cabac_bypass_alignment, "cabac_bypass_alignment_enabled_flag"),
+    ] {
+        b.set(shift, 1, flag as u32, name)?;
+    }
+    put32(d, 0xdc, b.0);
+    let p = &pps.rext;
+    let mut b = Bits(0);
+    b.set(0, 4, p.log2_max_transform_skip_size, "Log2MaxTransformSkipSize")?;
+    b.set(4, 1, p.cross_component_prediction as u32, "cross_component_prediction_enabled_flag")?;
+    b.set(5, 1, p.chroma_qp_offset_list_enabled as u32, "chroma_qp_offset_list_enabled_flag")?;
+    b.set(6, 2, p.diff_cu_chroma_qp_offset_depth, "diff_cu_chroma_qp_offset_depth")?;
+    b.set(8, 3, p.chroma_qp_offset_list_len, "chroma_qp_offset_list_len")?;
+    b.set(11, 3, p.log2_sao_offset_scale_luma, "log2_sao_offset_scale_luma")?;
+    b.set(14, 3, p.log2_sao_offset_scale_chroma, "log2_sao_offset_scale_chroma")?;
+    put32(d, 0xe0, b.0);
+    for i in 0..6 {
+        d[0xe4 + i] = p.cb_qp_offset_list[i] as u8;
+        d[0xea + i] = p.cr_qp_offset_list[i] as u8;
+    }
+    Ok(())
 }
 
 /// Engine scaling block (observed layout, see [`SCALING_LIST_OFFSET`]): DC[16x16 ×6, 32x32 ×2],

@@ -38,6 +38,8 @@ pub struct HevcDecoder {
     epoch_max_poc: Option<i32>,
     /// Session bit depth (8 = Main, 10 = Main 10); surfaces are sized for it.
     bit_depth: u32,
+    /// 4:4:4 surfaces (luma + CbCr plane of twice the pitch); parameter-driven sessions only.
+    chroma_444: bool,
     gen: NvdecGen,
 }
 
@@ -73,15 +75,28 @@ impl HevcDecoder {
         bit_depth: u32,
         codec_config: &[u8],
     ) -> VResult<Self> {
-        let layout = SurfaceLayout::new(
-            max_width,
-            max_height,
-            super::super::bytes_per_sample(bit_depth),
-        );
+        Self::with_format(decoder_class, max_width, max_height, bit_depth, false, codec_config)
+    }
+
+    /// `chroma_444`: the engine writes luma plus one interleaved CbCr plane of twice the luma pitch
+    /// (stock 615 captures: framestride[1] = 2 x framestride[0]). The Annex-B parser here accepts
+    /// 4:2:0 streams only; 4:4:4 pictures come from parameter-driven callers ([`Self::build_picture`]).
+    pub fn with_format(
+        decoder_class: u32,
+        max_width: u32,
+        max_height: u32,
+        bit_depth: u32,
+        chroma_444: bool,
+        codec_config: &[u8],
+    ) -> VResult<Self> {
+        let layout = Self::layout_of(max_width, max_height, bit_depth, chroma_444);
         let inputs = SessionInputs {
             // framestride in samples: stock hevc10 capture (352x288) writes 352 for its 704-byte
             // 16-bit pitch, hevc8 384 for a 384-byte pitch.
-            framestride: [layout.pitch / layout.bytes_per_sample; 2],
+            framestride: [
+                layout.pitch / layout.bytes_per_sample,
+                layout.chroma_pitch / layout.bytes_per_sample,
+            ],
             filter: filter_layout(max_height).0,
             gptimer_max: u32::MAX,
             general_bits: 1, // tileformat 1, GOB_2 (stock and V0)
@@ -116,8 +131,18 @@ impl HevcDecoder {
             epoch: 0,
             epoch_max_poc: None,
             bit_depth,
+            chroma_444,
             gen: NvdecGen::of(decoder_class),
         })
+    }
+
+    fn layout_of(max_width: u32, max_height: u32, bit_depth: u32, chroma_444: bool) -> SurfaceLayout {
+        let bps = super::super::bytes_per_sample(bit_depth);
+        if chroma_444 {
+            SurfaceLayout::new_444(max_width, max_height, bps)
+        } else {
+            SurfaceLayout::new(max_width, max_height, bps)
+        }
     }
 
     /// Session-owned layout for externally supplied HEVC picture parameters.
@@ -170,6 +195,9 @@ impl CodecDecoder for HevcDecoder {
     }
     fn bit_depth(&self) -> u32 {
         self.bit_depth
+    }
+    fn surface_layout(&self, max_width: u32, max_height: u32) -> SurfaceLayout {
+        Self::layout_of(max_width, max_height, self.bit_depth, self.chroma_444)
     }
     fn dpb_size(&self) -> usize {
         16

@@ -92,9 +92,6 @@ impl RefPic {
             self.frame_num as i32
         }
     }
-    fn frame_poc(&self) -> i32 {
-        self.poc[0].min(self.poc[1])
-    }
 }
 
 #[derive(Default)]
@@ -433,55 +430,12 @@ impl Decoder {
 
     /// Initial reference lists (8.2.4.2.1 P frames, 8.2.4.2.3 B frames) as DPB positions.
     fn initial_lists(&self, cur_frame_num: u32, cur_poc: i32, max_frame_num: u32) -> [Vec<u8>; 3] {
-        let refs: Vec<(u8, RefPic)> = self
-            .dpb
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| e.map(|r| (i as u8, r)))
-            .collect();
-        let mut st: Vec<(u8, RefPic)> = refs
-            .iter()
-            .copied()
-            .filter(|(_, r)| r.long_term_idx.is_none())
-            .collect();
-        let mut lt: Vec<(u8, RefPic)> = refs
-            .iter()
-            .copied()
-            .filter(|(_, r)| r.long_term_idx.is_some())
-            .collect();
-        lt.sort_by_key(|(_, r)| r.long_term_idx);
-        st.sort_by_key(|(_, r)| -r.frame_num_wrap(cur_frame_num, max_frame_num));
-        let p: Vec<u8> = st.iter().chain(lt.iter()).map(|(i, _)| *i).collect();
-        // Non-existing frames have no POC; they are left out of the B lists.
-        let mut before: Vec<(u8, RefPic)> = st
-            .iter()
-            .copied()
-            .filter(|(_, r)| !r.non_existing && r.frame_poc() < cur_poc)
-            .collect();
-        let mut after: Vec<(u8, RefPic)> = st
-            .iter()
-            .copied()
-            .filter(|(_, r)| !r.non_existing && r.frame_poc() > cur_poc)
-            .collect();
-        before.sort_by_key(|(_, r)| -r.frame_poc());
-        after.sort_by_key(|(_, r)| r.frame_poc());
-        let ltp: Vec<u8> = lt.iter().map(|(i, _)| *i).collect();
-        let b0: Vec<u8> = before
-            .iter()
-            .chain(after.iter())
-            .map(|(i, _)| *i)
-            .chain(ltp.iter().copied())
-            .collect();
-        let mut b1: Vec<u8> = after
-            .iter()
-            .chain(before.iter())
-            .map(|(i, _)| *i)
-            .chain(ltp.iter().copied())
-            .collect();
-        if b1.len() > 1 && b1 == b0 {
-            b1.swap(0, 1);
-        }
-        [p, b0, b1]
+        let dpb = std::array::from_fn(|i| self.dpb[i].map(|r| DescRef {
+            slot: r.slot, state: 3, long_term: r.long_term_idx.is_some(),
+            non_existing: r.non_existing, poc: r.poc,
+            frame_idx: r.long_term_idx.unwrap_or(r.frame_num),
+        }));
+        desc::initial_lists(&dpb, cur_frame_num, cur_poc, max_frame_num)
     }
 
     /// Builds the picture job for one access unit. `surface` is the caller's target surface id

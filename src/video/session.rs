@@ -291,6 +291,15 @@ pub struct Stats {
 
 impl Session {
     pub fn new(dev: &VideoDevice, info: SessionInfo, codec_config: &[u8]) -> VResult<Self> {
+        Self::new_inner(dev, info, codec_config, None)
+    }
+
+    /// Create a session driven by externally supplied picture parameters.
+    pub fn with_codec(dev: &VideoDevice, info: SessionInfo, codec: Box<dyn CodecDecoder>) -> VResult<Self> {
+        Self::new_inner(dev, info, &[], Some(codec))
+    }
+
+    fn new_inner(dev: &VideoDevice, info: SessionInfo, codec_config: &[u8], custom: Option<Box<dyn CodecDecoder>>) -> VResult<Self> {
         let class = dev.info.nvdec_class;
         if class == 0 {
             return Err(VideoError::Unsupported("GPU exposes no NVDEC class".into()));
@@ -349,7 +358,7 @@ impl Session {
             };
             return Err(VideoError::Unsupported(format!("{why}{hint}")));
         }
-        let mut codec: Box<dyn CodecDecoder> = match info.codec {
+        let mut codec: Box<dyn CodecDecoder> = if let Some(codec) = custom { codec } else { match info.codec {
             super::CODEC_VP9 => Box::new(super::vp9::Vp9Decoder::new(
                 class,
                 info.max_width,
@@ -376,7 +385,7 @@ impl Session {
                 codec_config,
             )?),
             c => return Err(VideoError::Unsupported(format!("codec {c} not built in"))),
-        };
+        }};
         // The codec decides the engine surface layout from its own bit depth, and the DPB
         // surfaces below are sized from it: a codec built for another depth would allocate
         // the wrong sample container silently.
@@ -928,7 +937,7 @@ impl Session {
                         &mut w,
                         4,
                         0x710,
-                        &[line_bytes.next_multiple_of(64), dst_rows, 1, 0],
+                        &[dst.pitch[p], dst_rows, 1, 0],
                     );
                     method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
                 }
@@ -1007,6 +1016,30 @@ impl Session {
     pub fn info(&self) -> &SessionInfo {
         &self.info
     }
+
+    /// Wait for a picture and check the decoder's completion status.
+    pub fn wait_picture(&mut self, id: u64) -> VResult<()> {
+        let pic = self.pictures.get(&id).ok_or_else(|| VideoError::Invalid(format!("unknown picture id {id}")))?;
+        self.nvdec.wait(&self.drm, pic.decoded_at)?;
+        self.poll_status()
+    }
+
+
+    /// Allocate PRIME-shareable memory for copy-engine output, including CPU readback.
+    pub fn allocate_output(&self, size: usize) -> VResult<OutputAllocation> {
+        let memory = self.device.allocate_vram(size)?;
+        let fd = crate::external::export(&memory, self.drm.as_fd())?;
+        Ok(OutputAllocation { fd, memory })
+    }
+
+    /// Complete a copy-out before the CPU maps its destination.
+    pub fn copy_out_wait(&mut self, id: u64, target: &Target) -> VResult<()> {
+        if let Some(fence) = self.copy_out(id, target)? {
+            wait_sync_file(std::os::fd::AsRawFd::as_raw_fd(&fence), Duration::from_secs(5))
+                .map_err(VideoError::DeviceLost)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Session {
@@ -1024,6 +1057,59 @@ impl Drop for Session {
                     wait_sync_file(std::os::fd::AsRawFd::as_raw_fd(&fd), Duration::from_secs(2));
             }
         }
+    }
+}
+
+/// Lightweight PRIME output allocator, independent of decoder channels and DPB pools.
+pub struct OutputAllocator {
+    device: Rc<Device>,
+    drm: std::fs::File,
+}
+impl OutputAllocator {
+    pub fn new(dev: &VideoDevice) -> VResult<Self> {
+        let (device, _) = open_rm(Some(dev.pci))?;
+        let drm = open_render_node(dev.pci)?;
+        Ok(Self { device, drm })
+    }
+
+    /// Initialize the entire allocation before exposing it to an external consumer.
+    pub fn allocate_zeroed(&self, size: usize) -> VResult<OutputAllocation> {
+        if size == 0 {
+            return Err(VideoError::Invalid("empty output allocation".into()));
+        }
+        let memory = self.device.allocate_vram(size)?;
+        let mut mapping = memory.map()?;
+        let zero = vec![0u8; size.min(65536)];
+        let mut offset = 0;
+        while offset < size {
+            let len = zero.len().min(size - offset);
+            mapping.write_bytes(offset, &zero[..len])?;
+            offset += len;
+        }
+        crate::platform::device_full_barrier();
+        let fd = crate::external::export(&memory, self.drm.as_fd())?;
+        Ok(OutputAllocation { fd, memory })
+    }
+}
+
+/// Production copy-out allocation; the fd and mapping keep their own kernel references.
+pub struct OutputAllocation {
+    pub fd: OwnedFd,
+    memory: Rc<Memory>,
+}
+impl OutputAllocation {
+    pub fn map(&self) -> VResult<OutputMapping> {
+        Ok(OutputMapping { mapping: self.memory.map()? })
+    }
+}
+
+/// Bounds-checked CPU view of a completed copy-out allocation.
+pub struct OutputMapping {
+    mapping: Mapping,
+}
+impl OutputMapping {
+    pub fn read_bytes(&self, offset: usize, out: &mut [u8]) -> VResult<()> {
+        Ok(self.mapping.read_bytes(offset, out)?)
     }
 }
 
@@ -1120,9 +1206,15 @@ impl TargetLayout {
                 )))
             }
         };
+        for p in 0..2 {
+            let minimum = if p == 0 { t.width } else { t.width.div_ceil(2) * 2 };
+            if !t.pitch[p].is_multiple_of(64) || t.pitch[p] < minimum.next_multiple_of(64) {
+                return Err(VideoError::Invalid(format!("block-linear plane {p} pitch {} is not a sufficient 64-byte stride", t.pitch[p])));
+            }
+        }
         Ok(Self {
             block: Some((h, kinds)),
-            pitch: [0, 0, 0],
+            pitch: t.pitch,
             planar: false,
         })
     }
@@ -1144,7 +1236,7 @@ impl TargetLayout {
         match self.block {
             None => u64::from(self.pitch[p]) * u64::from(rows.saturating_sub(1)) + u64::from(line),
             Some((h, _)) => {
-                u64::from(line.next_multiple_of(64)) * u64::from(rows.next_multiple_of(8 << h))
+                u64::from(self.pitch[p]) * u64::from(rows.next_multiple_of(8 << h))
             }
         }
     }
@@ -1189,6 +1281,11 @@ mod tests {
         }
         let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xc7b5, 1).unwrap();
         assert_eq!(t.block, Some((1, [0, 0])));
+        assert_eq!(t.pitch, [256, 256, 0]);
+        assert_eq!(t.plane_bytes(1, 32, 63, 1), 256 * 32);
+        let mut undersized = target(bl(0, 1, 2, 0xfe, 1));
+        undersized.pitch = [32, 32, 0];
+        assert!(TargetLayout::parse(&undersized, 0xc7b5, 1).is_err());
         assert!(TargetLayout::parse(&target(bl(1, 1, 2, 0xfe, 1)), 0xcab5, 1).is_err()); // compressed
         assert!(TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 1)), 0xc7b5, 1).is_err()); // g=3 pre-Blackwell
         assert!(TargetLayout::parse(&target(0x01 << 56 | 1), 0xcab5, 1).is_err()); // other vendor

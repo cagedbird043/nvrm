@@ -80,6 +80,40 @@ impl H264Decoder {
             gen: NvdecGen::of(decoder_class),
         })
     }
+    /// Build engine commands for an externally constructed picture descriptor.
+    pub fn build_picture(&mut self, ctx: &BuildContext, d: &mut [u8], setup: &[u8], slots: &[Option<u32>; MAX_SLOTS], app_id: u32, control_params: u32) -> VResult<Vec<u32>> {
+        if setup.len() > STATUS as usize { return Err(VideoError::Unsupported("H.264 slice table overlaps engine status".into())); }
+        d[..setup.len()].copy_from_slice(setup);
+        let da = ctx.descriptor;
+        let cur = ctx.surfaces[ctx.current];
+        let mut w = Vec::new();
+        let reloc = |w: &mut Vec<u32>, m: u32, va: u64| ctx.reloc(w, m, va);
+        method(&mut w, 4, 0x200, &[app_id]);
+        method(&mut w, 4, 0x400, &[control_params]);
+        reloc(&mut w, 0x404, da);
+        reloc(&mut w, 0x408, ctx.bitstream);
+        let legacy = app_id == legacy::APP_ID_H264;
+        if legacy { reloc(&mut w, 0x410, da + SLICE_OFFSETS); }
+        for (i, s) in slots.iter().enumerate() {
+            let s = s.map_or(cur, |s| ctx.surfaces[s as usize]);
+            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
+            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
+        }
+        reloc(&mut w, 0x414, self.colmv);
+        reloc(&mut w, 0x424, da + STATUS);
+        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
+        if legacy {
+            reloc(&mut w, 0x500, self.mbhist);
+            reloc(&mut w, 0x418, self.history);
+        } else {
+            reloc(&mut w, 0x680, da + SCALING);
+            reloc(&mut w, 0x4d0, self.filter);
+            if self.gen.ga10x_plus() { reloc(&mut w, 0x4c8, self.intra_top); }
+            if self.gen.blackwell_b() { reloc(&mut w, 0x4dc, self.buf_4dc); }
+        }
+        method(&mut w, 4, 0x300, &[0]);
+        Ok(w)
+    }
 }
 
 impl CodecDecoder for H264Decoder {
@@ -175,45 +209,7 @@ impl CodecDecoder for H264Decoder {
         if job.app_id == desc::APP_ID_NEW_H264 {
             job.setup.truncate(0x2e0);
         }
-        d[..job.setup.len()].copy_from_slice(&job.setup);
-        let da = ctx.descriptor;
-        let cur = ctx.surfaces[ctx.current];
-        let mut w = Vec::new();
-        // Relocation encoding per host class (stock reloc_4a8a0).
-        let reloc = |w: &mut Vec<u32>, m: u32, va: u64| ctx.reloc(w, m, va);
-        method(&mut w, 4, 0x200, &[job.app_id]);
-        method(&mut w, 4, 0x400, &[job.control_params]);
-        reloc(&mut w, 0x404, da);
-        reloc(&mut w, 0x408, ctx.bitstream);
-        let legacy = job.app_id == legacy::APP_ID_H264;
-        if legacy {
-            reloc(&mut w, 0x410, da + SLICE_OFFSETS);
-        }
-        for (i, s) in job.slot_surfaces.iter().enumerate() {
-            let s = s.map_or(cur, |s| ctx.surfaces[s as usize]);
-            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
-            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
-        }
-        reloc(&mut w, 0x414, self.colmv);
-        reloc(&mut w, 0x424, da + STATUS);
-        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
-        if legacy {
-            reloc(&mut w, 0x500, self.mbhist);
-            reloc(&mut w, 0x418, self.history);
-        } else {
-            reloc(&mut w, 0x680, da + SCALING);
-            reloc(&mut w, 0x4d0, self.filter);
-            // NEW_H264 runs on Blackwell+ only (all GA10x+); 0x4dc on blackwell_b classes only
-            // (gens.rs DECODE_GATES 0x443bc / 0x43ec5).
-            if self.gen.ga10x_plus() {
-                reloc(&mut w, 0x4c8, self.intra_top);
-            }
-            if self.gen.blackwell_b() {
-                reloc(&mut w, 0x4dc, self.buf_4dc);
-            }
-        }
-        method(&mut w, 4, 0x300, &[0]);
-        Ok(w)
+        self.build_picture(ctx, d, &job.setup, &job.slot_surfaces, job.app_id, job.control_params)
     }
     fn finish(
         &mut self,

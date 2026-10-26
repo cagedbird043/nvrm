@@ -108,6 +108,26 @@ pub struct DescInput<'a> {
     pub poc: [i32; 2],
 }
 
+/// Initial frame reference lists (8.2.4.2), before bitstream list modifications.
+pub fn initial_lists(dpb: &[Option<DescRef>; 16], frame_num: u32, poc: i32, max_frame_num: u32) -> [Vec<u8>; 3] {
+    let mut short = Vec::new();
+    let mut long = Vec::new();
+    for (i, r) in dpb.iter().enumerate().filter_map(|(i, r)| r.map(|r| (i, r))) {
+        if r.long_term { long.push((i as u8, r)); } else { short.push((i as u8, r)); }
+    }
+    long.sort_by_key(|(_, r)| r.frame_idx);
+    short.sort_by_key(|(_, r)| std::cmp::Reverse(if r.frame_idx > frame_num { r.frame_idx as i32 - max_frame_num as i32 } else { r.frame_idx as i32 }));
+    let p = short.iter().chain(&long).map(|(i, _)| *i).collect();
+    let mut before: Vec<_> = short.iter().filter(|(_, r)| !r.non_existing && r.poc[0].min(r.poc[1]) < poc).collect();
+    let mut after: Vec<_> = short.iter().filter(|(_, r)| !r.non_existing && r.poc[0].min(r.poc[1]) > poc).collect();
+    before.sort_by_key(|(_, r)| std::cmp::Reverse(r.poc[0].min(r.poc[1])));
+    after.sort_by_key(|(_, r)| r.poc[0].min(r.poc[1]));
+    let b0: Vec<_> = before.iter().chain(&after).map(|(i, _)| *i).chain(long.iter().map(|(i, _)| *i)).collect();
+    let mut b1: Vec<_> = after.iter().chain(&before).map(|(i, _)| *i).chain(long.iter().map(|(i, _)| *i)).collect();
+    if b1.len() > 1 && b1 == b0 { b1.swap(0, 1); }
+    [p, b0, b1]
+}
+
 fn put32(d: &mut [u8], o: usize, v: u32) {
     d[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }

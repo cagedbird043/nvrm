@@ -680,7 +680,12 @@ fn parse_pci(s: &str) -> VResult<[u32; 4]> {
 
 impl VideoDevice {
     pub fn open() -> VResult<Self> {
-        let (device, pci) = open_rm(None)?;
+        Self::open_on(None)
+    }
+
+    /// Open the GPU at `pci` (domain, bus, device, function); `None` selects as [`Self::open`].
+    pub fn open_on(pci: Option<[u32; 4]>) -> VResult<Self> {
+        let (device, pci) = open_rm(pci)?;
         let classes = device.classes()?;
         let nvdec_class = NVDEC_CLASSES
             .iter()

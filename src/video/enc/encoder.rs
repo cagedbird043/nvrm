@@ -775,14 +775,18 @@ impl Encoder {
         layout::in_tile_plane(c, uv, uvs, 4 * w, h, 4 * self.pitch);
         Ok(())
     }
-    /// Fills the next input slot from an external 4:2:0 dma-buf on the copy engine (NV12 for 8-bit,
-    /// P010 for 10-bit encodes); the visible `cfg.width` x `cfg.height` region is copied and the
-    /// padding stays zero, exactly as with the CPU loaders. `key` identifies the buffer: its
-    /// import is cached until [`Encoder::forget_dmabuf`].
+    /// Fills the next input slot from an external dma-buf on the copy engine: NV12/P010 for 4:2:0
+    /// encodes, 444P/Q416 (three planes) for 4:4:4 ones, 8-bit for 8-bit encodes and 16-bit for
+    /// 10-bit ones; the visible `cfg.width` x `cfg.height` region is copied and the padding stays
+    /// zero, exactly as with the CPU loaders. `key` identifies the buffer: its import is cached
+    /// until [`Encoder::forget_dmabuf`].
     pub fn load_dmabuf(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
         let ds = self.input_slot()?;
-        if src.bytes_per_sample as usize != self.bps || self.cfg.chroma444 {
+        if src.bytes_per_sample as usize != self.bps || src.chroma444 != self.cfg.chroma444 {
             return Err(invalid("dma-buf sample size or chroma format does not match the encoder"));
+        }
+        if src.chroma444 && self.cfg.codec == ENC_AV1 {
+            return Err(invalid("4:4:4 dma-buf ingest needs an H.264 or HEVC encoder"));
         }
         if self.cfg.aq != 0 && self.cfg.codec == ENC_HEVC {
             return Err(invalid("spatial AQ needs CPU-visible luma"));

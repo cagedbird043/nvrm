@@ -1160,6 +1160,14 @@ impl Session {
         }
         self.wait_picture(id)
     }
+
+    /// Queue a copy-out ordered after the decode (on the GPU with a native 64-bit timeline) and
+    /// return its fence without waiting. The fence may stand for a failed picture: the caller
+    /// checks the engine status with [`Session::wait_picture`] once it needs it. For consumers
+    /// that synchronise through the destination dma-buf's implicit fences.
+    pub fn copy_out_deferred(&mut self, id: u64, target: &Target) -> VResult<Option<OwnedFd>> {
+        self.copy_out_inner(id, target, true)
+    }
 }
 
 impl Drop for Session {

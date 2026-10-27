@@ -26,7 +26,7 @@ pub(super) fn guard(f: impl FnOnce() -> Result<i32, VideoError>) -> i32 {
     }
 }
 
-pub struct NvVideoDevice(VideoDevice);
+pub struct NvVideoDevice(pub(super) VideoDevice);
 pub struct NvVideoSession(Session);
 // SAFETY: a session's RM objects are only reachable through the session; the
 // header requires callers to serialise each session, so moving it between

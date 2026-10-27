@@ -38,6 +38,11 @@ path = "src/bin/nv-nvdec-probe.rs"
 name = "nv-venc-test"
 path = "src/bin/nv-venc-test.rs"
 
+[[bin]]
+name = "nvc2-xmlgen"
+path = "src/bin/nvc2-xmlgen.rs"
+required-features = ["xmlgen-cli"]
+
 [profile.release]
 # WorkerLiveness publishes loss and retains teardown ownership while unwinding.
 # Optimization must not replace this contract with process-wide panic abort.
@@ -52,3 +57,4 @@ default = ["prototype-vulkan"]
 prototype-vulkan = []
 # vast.ai hardware-invariant probe only; never enabled for the NVK bridge.
 diagnostics = []
+xmlgen-cli = []

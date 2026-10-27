@@ -1,5 +1,5 @@
-//! NVENC encoder core in Rust: a port of mickys/nvenc (MIT, commit 90d1d6a) as vendored in
-//! `nvidia-prolapse/media/core/nvenc/mickys/`, driven through this crate's RM services directly.
+//! NVENC encoder core in Rust: a port of mickys/nvenc (MIT, commit 90d1d6a),
+//! driven through this crate's RM services directly.
 //!
 //! [`Encoder::open_on`] selects a PCI GPU (domain, bus, device, function), using
 //! the same device-selection rules as the decoder. Load the next input surface,
@@ -27,6 +27,8 @@ pub mod av1hdr;
 pub mod av1probs;
 mod av1tables;
 mod encoder;
+mod error;
+pub use error::EncError;
 pub mod h264hdr;
 pub mod hevchdr;
 pub mod ingest;
@@ -36,6 +38,6 @@ pub mod tmpl_av1;
 pub mod tmpl_h264;
 pub mod tmpl_hevc;
 pub use encoder::{
-    EncConfig, EncFrame, Encoder, ENC_AV1, ENC_H264, ENC_HEVC, ENC_MAX_DEPTH, ENC_MAX_REFS,
+    EncConfig, EncFrame, EncFrameView, Encoder, ENC_AV1, ENC_H264, ENC_HEVC, ENC_MAX_DEPTH, ENC_MAX_REFS,
     ENC_MAX_SLICES,
 };

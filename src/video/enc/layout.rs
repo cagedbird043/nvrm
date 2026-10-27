@@ -62,16 +62,51 @@ pub fn in_tile_plane(
     dst: &mut [u8], src: &[u8], src_stride: usize, width: usize, rows: usize, pitch: usize,
 ) {
     if rows == 0 || width == 0 { return; }
-    let split = rows.div_ceil(16).div_ceil(2) * 16;
-    if split >= rows {
-        tile_rows(dst, src, src_stride, width, rows, pitch);
+    assert!(pitch.is_multiple_of(64) && width <= pitch && src_stride >= width);
+    assert!(src.len() >= (rows - 1) * src_stride + width);
+    assert!(dst.len() >= in_plane_size(pitch, rows));
+    #[cfg(target_arch = "x86_64")]
+    if (dst.as_ptr() as usize).is_multiple_of(16) {
+        use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+        for y0 in (0..rows).step_by(16) {
+            let count = (rows - y0).min(16);
+            let full = if count == 16 { width / 64 } else { 0 };
+            for tile in 0..full {
+                let mut d = y0 * pitch + tile * 1024;
+                for y8 in 0..2 {
+                    for x32 in 0..2 {
+                        for y4 in 0..2 {
+                            for x16 in 0..2 {
+                                for y in 0..4 {
+                                    let s = (y0 + y8 * 8 + y4 * 4 + y) * src_stride
+                                        + tile * 64 + x32 * 32 + x16 * 16;
+                                    // SAFETY: full tiles have 16 complete source rows; the
+                                    // checked destination is aligned and each store advances 16.
+                                    unsafe {
+                                        let v = _mm_loadu_si128(src.as_ptr().add(s).cast::<__m128i>());
+                                        _mm_stream_si128(dst.as_mut_ptr().add(d).cast::<__m128i>(), v);
+                                    }
+                                    d += 16;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for y in y0..y0 + count {
+                for x in (full * 64..width).step_by(16) {
+                    let n = (width - x).min(16);
+                    let d = in_offset(x, y, pitch);
+                    let s = y * src_stride + x;
+                    dst[d..d + n].copy_from_slice(&src[s..s + n]);
+                }
+            }
+        }
+        // SAFETY: publish all non-temporal stores before GPU submission.
+        unsafe { _mm_sfence() };
         return;
     }
-    let (a, b) = dst.split_at_mut((split * pitch).min(dst.len()));
-    std::thread::scope(|scope| {
-        scope.spawn(|| tile_rows(a, src, src_stride, width, split, pitch));
-        tile_rows(b, &src[split * src_stride..], src_stride, width, rows - split, pitch);
-    });
+    tile_rows(dst, src, src_stride, width, rows, pitch);
 }
 
 fn untile_rows(dst: &mut [u8], stride: usize, src: &[u8], width: usize, rows: usize, pitch: usize) {
@@ -103,11 +138,12 @@ pub fn in_untile_plane(
 
 // BT.709 video-range fixed-point conversion. Chroma uses the 2x2 sum;
 // odd widths and heights repeat the last pixel/row, just as blocklinear.c.
-fn bgra_rows(s0: &[u8], s1: &[u8], y0: &mut [u8], y1: &mut [u8], uv: &mut [u8], width: usize) {
+fn rgb_rows<const BGR:bool>(s0: &[u8], s1: &[u8], y0: &mut [u8], y1: &mut [u8], uv: &mut [u8], width: usize) {
+    let (ri,bi)=if BGR {(2,0)}else{(0,2)};
     for x in 0..width {
         let luma = |s: &[u8]| {
-            16 + ((47 * s[4 * x + 2] as i32 + 157 * s[4 * x + 1] as i32
-                + 16 * s[4 * x] as i32 + 128) >> 8)
+            16 + ((47 * s[4 * x + ri] as i32 + 157 * s[4 * x + 1] as i32
+                + 16 * s[4 * x + bi] as i32 + 128) >> 8)
         };
         y0[x] = luma(s0) as u8;
         y1[x] = luma(s1) as u8;
@@ -116,7 +152,7 @@ fn bgra_rows(s0: &[u8], s1: &[u8], y0: &mut [u8], y1: &mut [u8], uv: &mut [u8], 
         let x1 = (x + 1).min(width - 1);
         let sum = |c: usize| s0[4 * x + c] as i32 + s0[4 * x1 + c] as i32
             + s1[4 * x + c] as i32 + s1[4 * x1 + c] as i32;
-        let (r, g, b) = (sum(2), sum(1), sum(0));
+        let (r, g, b) = (sum(ri), sum(1), sum(bi));
         uv[x] = (128 + ((-26 * r - 87 * g + 112 * b + 512) >> 10)) as u8;
         uv[x + 1] = (128 + ((112 * r - 102 * g - 10 * b + 512) >> 10)) as u8;
     }
@@ -154,12 +190,11 @@ type ConvertRows = fn(&[u8], &[u8], &mut [u8], &mut [u8], &mut [u8], usize);
 
 fn convert_bands(
     luma: &mut [u8], chroma: &mut [u8], src: &[u8], stride: usize,
-    width: usize, rows: usize, pitch: usize, bytes: usize, convert: ConvertRows,
+    width: usize, rows: usize, pitch: usize, bytes: usize, convert: ConvertRows, buf: &mut [u8],
 ) {
     let even_width = (width + 1) & !1;
     let bw = (even_width * bytes).div_ceil(64) * 64;
     // Reuse the C core's cache-sized 32 luma + 16 chroma row scratch buffer.
-    let mut buf = vec![0; bw * 48];
     let (yb, uvb) = buf.split_at_mut(bw * 32);
     for r0 in (0..rows).step_by(32) {
         let count = (rows - r0).min(32);
@@ -169,42 +204,38 @@ fn convert_bands(
             let (before, after) = yb.split_at_mut((r + 1) * bw);
             convert(s0, s1, &mut before[r * bw..], &mut after[..bw], &mut uvb[(r / 2) * bw..], width);
         }
-        tile_rows(&mut luma[r0 * pitch..], yb, bw, width * bytes, count, pitch);
-        tile_rows(&mut chroma[(r0 / 2) * pitch..], uvb, bw, even_width * bytes, count.div_ceil(2), pitch);
+        in_tile_plane(&mut luma[r0 * pitch..], yb, bw, width * bytes, count, pitch);
+        in_tile_plane(&mut chroma[(r0 / 2) * pitch..], uvb, bw, even_width * bytes, count.div_ceil(2), pitch);
     }
 }
 
 fn convert_surface(
     luma: &mut [u8], chroma: &mut [u8], src: &[u8], stride: usize,
-    width: usize, rows: usize, pitch: usize, bytes: usize, convert: ConvertRows,
+    width: usize, rows: usize, pitch: usize, bytes: usize, convert: ConvertRows, scratch: &mut [u8],
 ) {
     if rows == 0 || width == 0 { return; }
-    // A super-band is two luma tile rows and one chroma tile row.
-    let split = rows.div_ceil(32).div_ceil(2) * 32;
-    if split >= rows {
-        convert_bands(luma, chroma, src, stride, width, rows, pitch, bytes, convert);
-        return;
-    }
-    let (ya, yb) = luma.split_at_mut((split * pitch).min(luma.len()));
-    let (uva, uvb) = chroma.split_at_mut((split / 2 * pitch).min(chroma.len()));
-    std::thread::scope(|scope| {
-        scope.spawn(|| convert_bands(ya, uva, src, stride, width, split, pitch, bytes, convert));
-        convert_bands(yb, uvb, &src[split * stride..], stride, width, rows - split, pitch, bytes, convert);
-    });
+    convert_bands(luma, chroma, src, stride, width, rows, pitch, bytes, convert, scratch);
 }
 
 pub fn in_tile_bgra(
     dst_luma: &mut [u8], dst_chroma: &mut [u8], src: &[u8], src_stride: usize,
-    width: usize, rows: usize, pitch: usize,
+    width: usize, rows: usize, pitch: usize, scratch: &mut [u8],
 ) {
-    convert_surface(dst_luma, dst_chroma, src, src_stride, width, rows, pitch, 1, bgra_rows);
+    convert_surface(dst_luma, dst_chroma, src, src_stride, width, rows, pitch, 1, rgb_rows::<true>, scratch);
+}
+
+pub(crate) fn in_tile_rgbx(
+    luma:&mut [u8],chroma:&mut [u8],src:&[u8],stride:usize,
+    width:usize,rows:usize,pitch:usize,scratch:&mut [u8],
+) {
+    convert_surface(luma,chroma,src,stride,width,rows,pitch,1,rgb_rows::<false>,scratch);
 }
 
 pub fn in_tile_l10r(
     dst_luma: &mut [u8], dst_chroma: &mut [u8], src: &[u8], src_stride: usize,
-    width: usize, rows: usize, pitch: usize,
+    width: usize, rows: usize, pitch: usize, scratch: &mut [u8],
 ) {
-    convert_surface(dst_luma, dst_chroma, src, src_stride, width, rows, pitch, 2, l10r_rows);
+    convert_surface(dst_luma, dst_chroma, src, src_stride, width, rows, pitch, 2, l10r_rows, scratch);
 }
 
 #[cfg(test)]
@@ -232,6 +263,26 @@ mod tests {
         for y in 0..rows {
             assert_eq!(&dst[y * stride..y * stride + width], &src[y * stride..y * stride + width]);
             assert!(dst[y * stride + width..(y + 1) * stride].iter().all(|&v| v == 0xcd));
+        }
+    }
+    #[test]
+    fn streaming_tiles_match_scalar_at_all_boundaries() {
+        for width in [1usize,15,16,17,63,64,65,127,128,129] {
+            for rows in [1,3,4,7,8,15,16,17,31,32,33] {
+                let pitch=width.div_ceil(64)*64;
+                let stride=width+13;
+                let src:Vec<u8>=(0..stride*rows).map(|i|(i*37) as u8).collect();
+                let n=in_plane_size(pitch,rows);
+                let mut expected=vec![0xa5;n];
+                tile_rows(&mut expected,&src,stride,width,rows,pitch);
+                for offset in 0..16 {
+                    let mut dst=vec![0xa5;n+16];
+                    in_tile_plane(&mut dst[offset..offset+n],&src,stride,width,rows,pitch);
+                    assert_eq!(&dst[offset..offset+n],expected,"w={width} h={rows} off={offset}");
+                    assert!(dst[..offset].iter().all(|&x|x==0xa5));
+                    assert!(dst[offset+n..].iter().all(|&x|x==0xa5));
+                }
+            }
         }
     }
 }

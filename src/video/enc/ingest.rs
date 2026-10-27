@@ -702,7 +702,8 @@ mod tests {
                         let got = get(&slot, slot_sz);
                         let mut want = vec![0u8; slot_sz];
                         let (l, c) = want.split_at_mut(luma_sz);
-                        in_tile_bgra(l, c, &linear, w * 4, w, h, pitch);
+                        let mut scratch=vec![0; ((w+1)&!1).div_ceil(64)*64*48];
+                        in_tile_bgra(l, c, &linear, w * 4, w, h, pitch, &mut scratch);
                         let tag = format!("{name} {w}x{h} {layout:?} pitch {src_pitch}");
                         assert_eq!(first_mismatch(&got, &want), None, "{tag}");
                         cases += 1;

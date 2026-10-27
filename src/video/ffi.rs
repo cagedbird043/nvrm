@@ -11,7 +11,7 @@ thread_local! {
     static LAST_ERROR: RefCell<CString> = RefCell::new(CString::default());
 }
 
-fn fail(e: VideoError) -> i32 {
+pub(super) fn fail(e: VideoError) -> i32 {
     let msg = e.message().replace('\0', " ");
     crate::diag::diag!("nv-video: {msg}");
     LAST_ERROR.with(|l| *l.borrow_mut() = CString::new(msg).unwrap_or_default());

@@ -16,6 +16,7 @@ pub mod bits;
 pub mod channel;
 pub(crate) mod compute;
 pub mod ffi;
+mod ffi_enc;
 pub mod enc;
 pub mod h264;
 pub mod hdr;

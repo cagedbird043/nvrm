@@ -13,6 +13,12 @@ use std::{
     mem::{align_of, size_of},
     time::Instant,
 };
+use super::EncError;
+
+pub struct EncFrameView<'a> {
+    pub frame: EncFrame,
+    pub data: &'a [u8],
+}
 
 pub const ENC_H264: i32 = 0;
 pub const ENC_HEVC: i32 = 1;
@@ -215,6 +221,10 @@ pub struct Encoder {
     idr_disp: i32,
     nslots: usize,
     av1_hid: Vec<u8>,
+    assembled: Vec<u8>,
+    conversion_scratch: Vec<u8>,
+    #[cfg(test)]
+    pub(crate) completion_fault: u32,
     av1_hid_slot: usize,
     av1_hid_disp: i32,
     av1_last_shown: i32,
@@ -465,6 +475,15 @@ impl Encoder {
         }
         let chan = EngineChannel::new(&rm.device, &rm.space, NV2080_ENGINE_TYPE_NVENC0, class, 0)?;
         let av1_hq = av1 && (cfg.quality || cfg.bframes > 0);
+        let assembly_capacity = bs[0].size.checked_mul(2).and_then(|n| n.checked_add(65536))
+            .ok_or_else(|| VideoError::NoMemory("encoder assembly size overflow".into()))?;
+        let mut assembled = Vec::new();
+        assembled.try_reserve_exact(assembly_capacity)
+            .map_err(|e| VideoError::NoMemory(e.to_string()))?;
+        let mut conversion_scratch=Vec::new();
+        conversion_scratch.try_reserve_exact(up(w * 2,64) * 48)
+            .map_err(|e|VideoError::NoMemory(e.to_string()))?;
+        conversion_scratch.resize(up(w * 2,64) * 48,0);
         Ok(Self {
             chan,
             ingest: None,
@@ -516,6 +535,10 @@ impl Encoder {
             slot_poc: [0; 6],
             idr_disp: 0,
             nslots,
+            assembled,
+            conversion_scratch,
+            #[cfg(test)]
+            completion_fault: 0,
             av1_hid: if av1 {
                 Vec::with_capacity(bs_capacity(mbs))
             } else {
@@ -698,6 +721,42 @@ impl Encoder {
         }
         self.aq_valid[slot] = true;
     }
+    /// CPU-only 8-bit 420 session loader. All slice extents were checked at the ABI.
+    pub(crate) fn load_c2(&mut self,format:u32,p:[&[u8];3],strides:[usize;3])->Result<(),EncError> {
+        if self.inflight()>=self.cfg.depth as usize {return Err(EncError::InputSlotsBusy);}
+        let ds=self.seq as usize%self.cfg.depth as usize;
+        let (w,h,pitch)=(self.cfg.width as usize,self.cfg.height as usize,self.pitch);
+        if self.bps!=1 || self.cfg.chroma444 || format>4 {
+            return Err(EncError::InternalInvariant {reason:"C2 loader configuration"});
+        }
+        let (luma,chroma)=self.input[ds].bytes_mut().split_at_mut(self.luma_sz);
+        self.aq_valid[ds]=false;
+        if format>=3 {
+            let convert=if format==3 {layout::in_tile_rgbx}else{layout::in_tile_bgra};
+            convert(luma,chroma,p[0],strides[0],w,h,pitch,&mut self.conversion_scratch);
+            return Ok(());
+        }
+        layout::in_tile_plane(luma,p[0],strides[0],w,h,pitch);
+        if format==0 {
+            layout::in_tile_plane(chroma,p[1],strides[1],w,h/2,pitch);
+            return Ok(());
+        }
+        let bw=up(w,64);
+        let band=&mut self.conversion_scratch[..bw*16];
+        for r0 in (0..h/2).step_by(16) {
+            let count=(h/2-r0).min(16);
+            for r in 0..count {
+                for x in 0..w/2 {
+                    let (u,v)=if format==1 {
+                        let s=(r0+r)*strides[1]+2*x;(p[1][s+1],p[1][s])
+                    } else {(p[1][(r0+r)*strides[1]+x],p[2][(r0+r)*strides[2]+x])};
+                    band[r*bw+2*x]=u;band[r*bw+2*x+1]=v;
+                }
+            }
+            layout::in_tile_plane(&mut chroma[r0*pitch..],band,bw,w,count,pitch);
+        }
+        Ok(())
+    }
     pub fn load_nv12(&mut self, y: &[u8], ys: usize, uv: &[u8], uvs: usize) -> VResult<()> {
         let ds = self.input_slot()?;
         self.aq_compute(y, ys, 1);
@@ -863,6 +922,7 @@ impl Encoder {
             self.cfg.width as usize,
             self.cfg.height as usize,
             self.pitch * 2,
+            &mut self.conversion_scratch,
         );
         Ok(())
     }
@@ -877,6 +937,7 @@ impl Encoder {
             self.cfg.width as usize,
             self.cfg.height as usize,
             self.pitch,
+            &mut self.conversion_scratch,
         );
         Ok(())
     }
@@ -1748,7 +1809,12 @@ impl Encoder {
         self.submit_ex(force_idr, false, -1)
     }
     pub fn submit_ex(&mut self, force_idr: bool, is_b: bool, disp: i32) -> VResult<u32> {
-        let ds = self.input_slot()?;
+        self.submit_checked(force_idr,is_b,disp).map_err(Into::into)
+    }
+    pub(crate) fn submit_checked(&mut self,force_idr:bool,is_b:bool,disp:i32)->Result<u32,EncError> {
+        let ds = if self.inflight() >= self.cfg.depth as usize {
+            return Err(EncError::InputSlotsBusy);
+        } else {self.seq as usize % self.cfg.depth as usize};
         let b = is_b && self.cfg.bframes > 0 && self.nrefs >= 2;
         let idr = !b
             && (force_idr
@@ -1971,7 +2037,7 @@ impl Encoder {
             ref_oh[i] = (self.slot_poc[self.slot_of[i]] / 2) as i32;
         }
         let t0 = Instant::now();
-        let timeline = self.chan.submit(words)?;
+        let timeline = self.chan.submit_enc(words)?;
         self.seq = payload;
         self.pend[ds] = Pending {
             idr,
@@ -2011,20 +2077,45 @@ impl Encoder {
 
 impl Encoder {
     pub fn wait(&mut self, ticket: u32, out: &mut Vec<u8>) -> VResult<EncFrame> {
+        let view = self.wait_view(ticket).map_err(VideoError::from)?;
+        out.extend_from_slice(view.data);
+        Ok(view.frame)
+    }
+    pub fn recover_picture(&mut self) {
+        self.force_idr = true;
+        self.nrefs = 0;
+        self.av1_hid.clear();
+        self.av1_last_shown = -1;
+    }
+    pub fn wait_view(&mut self, ticket: u32) -> Result<EncFrameView<'_>, EncError> {
+        let result = self.complete_view(ticket);
+        let (frame, ds, offset, length, assembled) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                if e.recoverable() { self.recover_picture(); }
+                return Err(e);
+            }
+        };
+        let data = if assembled { &self.assembled[..length] }
+            else { &self.bs[ds].bytes()[offset..offset + length] };
+        Ok(EncFrameView { frame, data })
+    }
+    fn complete_view(&mut self, ticket: u32) -> Result<(EncFrame, usize, usize, usize, bool), EncError> {
         if ticket != self.waited.wrapping_add(1)
-            || ticket.wrapping_sub(self.waited) > self.seq.wrapping_sub(self.waited)
-        {
-            return Err(invalid(
-                "encoder tickets must be waited in submission order",
-            ));
+            || ticket.wrapping_sub(self.waited) > self.seq.wrapping_sub(self.waited) {
+            return Err(EncError::TicketOrder { expected: self.waited.wrapping_add(1), actual: ticket });
         }
         let ds = ticket.wrapping_sub(1) as usize % self.cfg.depth as usize;
         let p = self.pend[ds].clone();
-        let done = self.chan.wait(&self.rm.drm, p.timeline);
+        let done = self.chan.wait_enc(&self.rm.drm, p.timeline);
         self.waited = ticket;
-        if let Err(e) = done {
-            self.force_idr = true;
-            return Err(e);
+        done?;
+        #[cfg(test)]
+        match std::mem::take(&mut self.completion_fault) {
+            1 => return Err(EncError::FrameMicrocode {ticket,status:0x41}),
+            2 => return Err(EncError::Av1TileCount {expected:self.tile_cols*self.tile_rows,actual:129}),
+            3 => return Err(EncError::ChannelTimeout {ticket:p.timeline}),
+            _ => {},
         }
         let st = self.status[ds].view::<nvenc_pic_stat_s>(0);
         let mut frame = EncFrame {
@@ -2042,20 +2133,29 @@ impl Encoder {
             ms: p.t0.elapsed().as_secs_f64() * 1000.0,
             hidden: false,
         };
-        if st.ucode_error_status() != 0
-            || st.total_bit_count == 0
-            || st.total_bit_count as usize / 8 >= self.bs[ds].size
-        {
-            self.force_idr = true;
-            return Err(VideoError::DeviceLost(format!(
-                "NVENC frame {ticket}: microcode error {}, {} bits",
-                st.ucode_error_status(),
-                st.total_bit_count
-            )));
+        if st.ucode_error_status() != 0 {
+            return Err(EncError::FrameMicrocode { ticket, status: st.ucode_error_status() });
         }
-        let start = out.len();
+        if st.total_bit_count == 0 { return Err(EncError::EmptyBitstream { ticket }); }
+        let off = st.bitstream_start_pos as usize;
+        let size = st.total_bit_count as usize / 8;
+        let capacity = self.bs[ds].size;
+        if size >= capacity || off.checked_add(size).is_none_or(|end| end > capacity) {
+            return Err(EncError::BitstreamRange { offset: off, bytes: size, capacity });
+        }
+        let assembled = self.cfg.codec == ENC_AV1 || (p.idr && (self.cfg.has_mdcv || self.cfg.has_cll));
+        if !assembled {
+            frame.size = size;
+            return Ok((frame, ds, off, size, false));
+        }
+        // Temporarily move only the Vec owner, never its bytes. Restore on errors too.
+        let mut out = std::mem::take(&mut self.assembled);
+        out.clear();
         if self.cfg.codec == ENC_AV1 {
-            self.av1_assemble(ds, out, &mut frame)?;
+            if let Err(e) = self.av1_assemble(ds, &mut out, &mut frame) {
+                self.assembled = out;
+                return Err(e);
+            }
         } else {
             if p.idr {
                 h264hdr::write_hdr_sei(
@@ -2070,19 +2170,15 @@ impl Encoder {
                     } else {
                         None
                     },
-                    out,
+                    &mut out,
                 );
             }
-            let off = st.bitstream_start_pos as usize;
-            let size = st.total_bit_count as usize / 8;
-            let data = self.bs[ds]
-                .bytes()
-                .get(off..off + size)
-                .ok_or_else(|| invalid("NVENC bitstream exceeds output allocation"))?;
-            out.extend_from_slice(data);
+            out.extend_from_slice(&self.bs[ds].bytes()[off..off + size]);
         }
-        frame.size = out.len() - start;
-        Ok(frame)
+        frame.size = out.len();
+        let length = out.len();
+        self.assembled = out;
+        Ok((frame, ds, 0, length, true))
     }
     pub fn encode(&mut self, force_idr: bool, out: &mut Vec<u8>) -> VResult<EncFrame> {
         let t = self.submit(force_idr)?;
@@ -2098,7 +2194,7 @@ impl Encoder {
         let t = self.submit_ex(force_idr, b, disp)?;
         self.wait(t, out)
     }
-    fn av1_assemble(&mut self, ds: usize, out: &mut Vec<u8>, frame: &mut EncFrame) -> VResult<()> {
+    fn av1_assemble(&mut self, ds: usize, out: &mut Vec<u8>, frame: &mut EncFrame) -> Result<(), EncError> {
         let p = &self.pend[ds];
         let st = self.status[ds].view::<nvenc_av1_pic_stat_s>(0);
         let key = p.idr;
@@ -2156,7 +2252,7 @@ impl Encoder {
         }
         let nt = self.tile_cols * self.tile_rows;
         if st.num_tiles as usize != nt || nt > 128 {
-            return Err(invalid("NVENC AV1 tile count mismatch"));
+            return Err(EncError::Av1TileCount { expected: nt, actual: st.num_tiles as usize });
         }
         let stats = self.status[ds].bytes();
         let bs = self.bs[ds].bytes();
@@ -2165,11 +2261,15 @@ impl Encoder {
             let off = get32(stats, 0x100 + 16 * i) as usize;
             let size = get32(stats, 0x104 + 16 * i) as usize;
             if size == 0 {
-                return Err(invalid("empty NVENC AV1 tile"));
+                return Err(EncError::Av1EmptyTile { tile: i });
             }
-            *tile = bs
-                .get(off..off + size)
-                .ok_or_else(|| invalid("NVENC AV1 tile exceeds output allocation"))?;
+            *tile = off.checked_add(size).and_then(|end| bs.get(off..end))
+                .ok_or(EncError::Av1TileRange { tile: i, offset: off, bytes: size, capacity: bs.len() })?;
+        }
+        let required = tiles[..nt].iter().try_fold(self.av1_hid.len() + 65536usize,
+            |sum, tile| sum.checked_add(tile.len())).ok_or(EncError::OutputAssemblyCapacity)?;
+        if out.capacity() < required || (fp.hidden && self.av1_hid.capacity() < required) {
+            return Err(EncError::OutputAssemblyCapacity);
         }
         if fp.hidden {
             self.av1_hid.clear();

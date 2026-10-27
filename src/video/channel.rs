@@ -177,7 +177,12 @@ impl EngineChannel {
 
     /// Append the timeline release and kick. Returns the timeline value that
     /// signals completion. Never waits.
-    pub fn submit(&mut self, mut words: Vec<u32>) -> VResult<u64> {
+    pub fn submit(&mut self, words: Vec<u32>) -> VResult<u64> {
+        self.submit_enc(words).map_err(Into::into)
+    }
+    pub(crate) fn submit_enc(&mut self, mut words: Vec<u32>) -> Result<u64, super::enc::EncError> {
+        use super::enc::EncError;
+        let op=|stage,source| EncError::ChannelOperation {stage,source};
         let value = self.submitted + 1;
         crate::gpu::timeline_release(
             &mut words,
@@ -185,10 +190,10 @@ impl EngineChannel {
             self.timeline.native64(),
             self.timeline.address(),
             value,
-        )?;
+        ).map_err(|e| op("timeline release",e.into()))?;
         let bytes = words.len() * 4;
         if bytes > COMMAND_BYTES / 8 {
-            return Err(VideoError::Invalid("video engine method list too long".into()));
+            return Err(EncError::CommandListTooLong { bytes });
         }
         // At most 4 pictures are in flight (descriptor ring), each well under
         // COMMAND_BYTES/8, so wrapping never overwrites unread commands.
@@ -196,34 +201,32 @@ impl EngineChannel {
             self.cmd_off = 0;
         }
         for (k, w) in words.iter().enumerate() {
-            self.command.write_u32(self.cmd_off + k * 4, *w)?;
+            self.command.write_u32(self.cmd_off + k * 4, *w).map_err(|e| op("command write",e.into()))?;
         }
         let entry =
             (self.command_va + self.cmd_off as u64) | ((words.len() as u64) << 42) | (1 << 41);
         self.cmd_off += bytes.next_multiple_of(256);
-        self.timeline.publish_maximum(value)?;
-        self.ring.write_u32(self.put * 8, entry as u32)?;
+        self.timeline.publish_maximum(value).map_err(|e| op("timeline publish",e.into()))?;
+        self.ring.write_u32(self.put * 8, entry as u32).map_err(|e| op("ring write",e.into()))?;
         self.ring
-            .write_u32(self.put * 8 + 4, (entry >> 32) as u32)?;
+            .write_u32(self.put * 8 + 4, (entry >> 32) as u32).map_err(|e| op("ring write",e.into()))?;
         self.put = (self.put + 1) % ENTRIES;
         crate::platform::device_full_barrier();
         let put = self.put as u32;
-        self.ring.write_u32(ENTRIES * 8 + 0x8c, put)?; // GPPut
+        self.ring.write_u32(ENTRIES * 8 + 0x8c, put).map_err(|e| op("GPPut write",e.into()))?;
         crate::platform::device_full_barrier();
         // Ring and USERD are VRAM written through BAR1 (write-combined). A BAR0
         // doorbell (pre-Hopper usermode) can overtake those posted writes, so
         // GP_PUT is read back through BAR1 first, exactly as the graphics
         // queue's kick (gpu.rs Queue::kick, measured stranded batches without it).
         if !self.bar1_doorbell {
-            let visible = self.ring.read_u32(ENTRIES * 8 + 0x8c)?;
+            let visible = self.ring.read_u32(ENTRIES * 8 + 0x8c).map_err(|e| op("GPPut read",e.into()))?;
             if visible != put {
-                return Err(VideoError::DeviceLost(format!(
-                    "video engine GP_PUT read back {visible} after writing {put}; channel state unknown"
-                )));
+                return Err(EncError::PutReadbackMismatch { expected: put, observed: visible });
             }
             crate::platform::device_full_barrier();
         }
-        self.doorbell.write_u32(0x90, self.token)?;
+        self.doorbell.write_u32(0x90, self.token).map_err(|e| op("doorbell write",e.into()))?;
         crate::platform::device_full_barrier();
         self.submitted = value;
         Ok(value)
@@ -236,18 +239,16 @@ impl EngineChannel {
     /// Block until `value` completed: sync_file of the timeline + poll(2), no
     /// spinning. A 2 s bound turns a hung engine into DEVICE_LOST.
     pub fn wait(&self, drm: &std::fs::File, value: u64) -> VResult<()> {
-        if self.completed()? >= value {
+        self.wait_enc(drm,value).map_err(Into::into)
+    }
+    pub(crate) fn wait_enc(&self, drm: &std::fs::File, value: u64) -> Result<(),super::enc::EncError> {
+        use super::enc::EncError;
+        if self.completed().map_err(|source|EncError::ChannelOperation {stage:"completion read",source})? >= value {
             return Ok(());
         }
-        let fd = self.timeline.context_fence(drm.as_raw_fd(), value)?;
-        wait_sync_file(fd.as_raw_fd(), Duration::from_secs(2)).map_err(|e| {
-            let gpget = self.ring.read_u32(ENTRIES * 8 + 0x88).unwrap_or(u32::MAX);
-            VideoError::DeviceLost(format!(
-                "video engine submission {value} did not complete ({e}; completed {:?}, GPGet {gpget}, put {})",
-                self.completed().ok(),
-                self.put
-            ))
-        })?;
+        let fd=self.timeline.context_fence(drm.as_raw_fd(),value)
+            .map_err(|e|EncError::ChannelOperation {stage:"completion fence",source:e.into()})?;
+        wait_sync_file_enc(fd.as_raw_fd(),Duration::from_secs(2),value)?;
         crate::platform::device_full_barrier();
         Ok(())
     }
@@ -277,6 +278,10 @@ extern "C" {
 
 /// poll(POLLIN) on a sync_file until it signals or `timeout` elapses.
 pub(crate) fn wait_sync_file(fd: i32, timeout: Duration) -> Result<(), String> {
+    wait_sync_file_enc(fd,timeout,0).map_err(|e|e.to_string())
+}
+fn wait_sync_file_enc(fd:i32,timeout:Duration,ticket:u64)->Result<(),super::enc::EncError> {
+    use super::enc::EncError;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -289,16 +294,16 @@ pub(crate) fn wait_sync_file(fd: i32, timeout: Duration) -> Result<(), String> {
         let r = unsafe { poll(&mut p, 1, left.as_millis().min(i32::MAX as u128) as i32) };
         if r > 0 {
             if p.revents & (8 | 32) != 0 {
-                return Err(format!("sync_file poll error revents {:#x}", p.revents));
+                return Err(EncError::FencePoll {errno:0,revents:p.revents});
             }
             return Ok(());
         }
         if r == 0 {
-            return Err(format!("sync_file not signalled after {timeout:?}"));
+            return Err(EncError::ChannelTimeout {ticket});
         }
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(format!("poll: {e}"));
+            return Err(EncError::FencePoll {errno:e.raw_os_error().unwrap_or(0),revents:p.revents});
         }
     }
 }

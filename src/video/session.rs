@@ -180,6 +180,48 @@ impl CopyEngine {
         }
         Ok(())
     }
+
+    /// Submits `words` (methods for this engine's copy class, SET_OBJECT included) and returns
+    /// after the copy engine finished them.
+    pub(crate) fn run(
+        &mut self,
+        device: &Rc<Device>,
+        space: &AddressSpace,
+        drm: i32,
+        words: &[u32],
+    ) -> VResult<()> {
+        let ci = match self
+            .commands
+            .iter()
+            .position(|(_, token)| *token == 0 || self.queue.shared().retired(*token).unwrap_or(false))
+        {
+            Some(i) => i,
+            None => {
+                self.commands.push((vram(device, space, 4096)?, 0));
+                self.commands.len() - 1
+            }
+        };
+        if words.len() * 4 > 4096 {
+            return Err(VideoError::Invalid("copy command buffer exceeds 4 KiB".into()));
+        }
+        let cmd = &mut self.commands[ci].0;
+        for (i, word) in words.iter().enumerate() {
+            cmd.cpu.write_u32(i * 4, *word)?;
+        }
+        crate::platform::device_full_barrier();
+        let push = Push { address: cmd.gpu.address(), size: (words.len() * 4) as u32, flags: 0 };
+        let token = match self.queue.submit(&[push], space, &[], &[], &[], |_| Ok(()))? {
+            SubmitStatus::Submitted(t) => t,
+            SubmitStatus::Full(_) => return Err(VideoError::Again("copy queue full".into())),
+        };
+        self.commands[ci].1 = token;
+        if !self.queue.shared().retired(token)? {
+            let fence = self.queue.context_fence(drm, token)?;
+            wait_sync_file(std::os::fd::AsRawFd::as_raw_fd(&fence), Duration::from_secs(5))
+                .map_err(VideoError::DeviceLost)?;
+        }
+        Ok(())
+    }
 }
 
 /// Admission of one decode unit (`NV_VIDEO_E_AGAIN` otherwise), decided before

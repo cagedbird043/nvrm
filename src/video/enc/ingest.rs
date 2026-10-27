@@ -8,13 +8,12 @@
 //! `tests::chroma_444_interleave`). No pixel crosses the CPU. The dma-bufs are imported into the
 //! encoder's own address space once per key and stay mapped until [`Ingest::forget`].
 use super::super::{
-    channel::wait_sync_file,
     compute::ComputeEngine,
     session::{vram, CopyEngine, VramBuffer},
     VResult, VideoError,
 };
 use crate::{
-    gpu::{hi_lo, method, Push, SubmitStatus},
+    gpu::{hi_lo, method},
     rm::Memory,
     gpu::GpuMapping,
 };
@@ -22,7 +21,6 @@ use std::{
     collections::HashMap,
     os::fd::{AsFd, AsRawFd, BorrowedFd},
     rc::Rc,
-    time::Duration,
 };
 
 /// Source surface layout. `BlockLinear` is NVIDIA's 2D block-linear with 64-byte wide blocks of
@@ -229,7 +227,7 @@ impl Ingest {
     }
 
     /// Rejects a plane whose pitch or offset cannot hold `rows` rows of `line` bytes in `size`.
-    fn check_plane(layout: Layout, plane: &Plane, line: u32, rows: u32, size: u64) -> VResult<()> {
+    pub(crate) fn check_plane(layout: Layout, plane: &Plane, line: u32, rows: u32, size: u64) -> VResult<()> {
         let need = match layout {
             Layout::Linear => u64::from(plane.pitch) * u64::from(rows - 1) + u64::from(line),
             Layout::BlockLinear { log2_height } => {
@@ -343,43 +341,7 @@ impl Ingest {
 
     /// Submits `words` on the copy engine and returns after it finished.
     fn run(&mut self, rm: &super::super::venc::NvVencDevice, words: &[u32]) -> VResult<()> {
-        let ci = match self.engine.commands.iter().position(|(_, token)| {
-            *token == 0 || self.engine.queue.shared().retired(*token).unwrap_or(false)
-        }) {
-            Some(i) => i,
-            None => {
-                self.engine.commands.push((vram(&rm.device, &rm.space, 4096)?, 0));
-                self.engine.commands.len() - 1
-            }
-        };
-        let cmd = &mut self.engine.commands[ci].0;
-        for (i, word) in words.iter().enumerate() {
-            cmd.cpu.write_u32(i * 4, *word)?;
-        }
-        crate::platform::device_full_barrier();
-        let push = Push {
-            address: cmd.gpu.address(),
-            size: (words.len() * 4) as u32,
-            flags: 0,
-        };
-        let token = match self
-            .engine
-            .queue
-            .submit(&[push], &rm.space, &[], &[], &[], |_| Ok(()))?
-        {
-            SubmitStatus::Submitted(t) => t,
-            SubmitStatus::Full(_) => return Err(VideoError::Again("copy queue full".into())),
-        };
-        self.engine.commands[ci].1 = token;
-        if !self.engine.queue.shared().retired(token)? {
-            let fence = self
-                .engine
-                .queue
-                .context_fence(rm.drm.as_raw_fd(), token)?;
-            wait_sync_file(fence.as_raw_fd(), Duration::from_secs(5))
-                .map_err(VideoError::DeviceLost)?;
-        }
-        Ok(())
+        self.engine.run(&rm.device, &rm.space, rm.drm.as_raw_fd(), words)
     }
 
     /// Copies the visible region of `source` into `dst` and returns after the copy engine finished.

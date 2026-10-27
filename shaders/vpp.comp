@@ -1,0 +1,219 @@
+// Video processing (src/video/vpp.rs): bilinear scaling, cropping, colour conversion and the
+// background fill of one picture into another, both pitch-linear. One invocation: 4 columns x 2
+// rows of the output picture (and, for 4:2:0 output, the 2 CbCr pairs below them), so every store
+// is a whole 32-bit word; columns past the width land in the row padding (pitches are 64-byte
+// multiples).
+//
+// Coordinates are continuous, in luma pixels of each picture, pixel i covering [i, i + 1). An
+// output sample at Q inside the output region reads the input at
+// P = src + (Q - dst) * scale, every plane bilinearly from its own sample grid (4:2:0 chroma
+// sample k sits at 2k + site), with taps clamped to the source region. The sample is converted by
+// the affine 3x4 matrix `m` from input codes (Y, Cb, Cr or R, G, B) to output codes, rounded and
+// clamped. Outside the output region the background codes are written. An identity matrix and
+// unit scale reproduce the input exactly.
+#version 450
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer Src0 { uint s0[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Src1 { uint s1[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Src2 { uint s2[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer Dst0 { uint d0[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Dst1 { uint d1[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer Dst2 { uint d2[]; };
+layout(set = 0, binding = 6, std430) readonly buffer Params {
+    uint src_kind;  // 0: 4:2:0 (luma, CbCr), 1: 4:4:4 (luma, Cb, Cr), 2: packed RGB
+    uint src_bps;   // bytes per sample (1, 2); 4 for RGB
+    uint src_shift; // code = container >> shift
+    uint src_order; // RGB bytes: 0 = B, G, R, A; 1 = R, G, B, A
+    uint dst_kind;
+    uint dst_bps;
+    uint dst_shift;
+    uint dst_order;
+    uint src_pitch0;
+    uint src_pitch1;
+    uint src_pitch2;
+    uint dst_pitch0;
+    uint dst_pitch1;
+    uint dst_pitch2;
+    uint dst_width;
+    uint dst_height;
+    int luma_lo_x;
+    int luma_lo_y;
+    int luma_hi_x;
+    int luma_hi_y;
+    int chroma_lo_x;
+    int chroma_lo_y;
+    int chroma_hi_x;
+    int chroma_hi_y;
+    float scale_x;
+    float scale_y;
+    float src_x;
+    float src_y;
+    float dst_x0;
+    float dst_y0;
+    float dst_x1;
+    float dst_y1;
+    float in_site_x;
+    float in_site_y;
+    float out_site_x;
+    float out_site_y;
+    float out_max;
+    uint bg0;
+    uint bg1;
+    uint bg2;
+    uint bg_alpha;
+    float m[12];
+} p;
+
+uint src_word(uint plane, uint index)
+{
+    if (plane == 0u)
+        return s0[index];
+    if (plane == 1u)
+        return s1[index];
+    return s2[index];
+}
+
+// Code of sample `comp` of element (x, y) of a YUV plane with `elems` samples per element.
+float yuv_tap(uint plane, uint pitch, uint elems, uint comp, int x, int y)
+{
+    uint off = uint(y) * pitch + (uint(x) * elems + comp) * p.src_bps;
+    uint w = src_word(plane, off >> 2);
+    uint v = p.src_bps == 1u ? (w >> ((off & 3u) * 8u)) & 255u : (w >> ((off & 2u) * 8u)) & 65535u;
+    return float(v >> p.src_shift);
+}
+
+vec3 rgb_tap(int x, int y)
+{
+    uint w = s0[(uint(y) * p.src_pitch0 + uint(x) * 4u) >> 2];
+    vec3 c = vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u));
+    return p.src_order == 0u ? c.zyx : c;
+}
+
+// Bilinear taps of continuous sample-index coordinate `u` inside [lo, hi].
+void taps(float u, int lo, int hi, out int i0, out int i1, out float f)
+{
+    float fl = floor(u);
+    f = u - fl;
+    i0 = clamp(int(fl), lo, hi);
+    i1 = clamp(int(fl) + 1, lo, hi);
+}
+
+float yuv_bilinear(uint plane, uint pitch, uint elems, uint comp, int x0, int x1, int y0, int y1, float fx, float fy)
+{
+    float a = mix(yuv_tap(plane, pitch, elems, comp, x0, y0), yuv_tap(plane, pitch, elems, comp, x1, y0), fx);
+    float b = mix(yuv_tap(plane, pitch, elems, comp, x0, y1), yuv_tap(plane, pitch, elems, comp, x1, y1), fx);
+    return mix(a, b, fy);
+}
+
+// Input codes at source position `pos` (luma pixels).
+vec3 sample_src(vec2 pos)
+{
+    int x0, x1, y0, y1;
+    float fx, fy;
+    taps(pos.x - 0.5, p.luma_lo_x, p.luma_hi_x, x0, x1, fx);
+    taps(pos.y - 0.5, p.luma_lo_y, p.luma_hi_y, y0, y1, fy);
+    if (p.src_kind == 2u)
+        return mix(mix(rgb_tap(x0, y0), rgb_tap(x1, y0), fx), mix(rgb_tap(x0, y1), rgb_tap(x1, y1), fx), fy);
+    float luma = yuv_bilinear(0u, p.src_pitch0, 1u, 0u, x0, x1, y0, y1, fx, fy);
+    if (p.src_kind == 0u) {
+        taps((pos.x - p.in_site_x) * 0.5, p.chroma_lo_x, p.chroma_hi_x, x0, x1, fx);
+        taps((pos.y - p.in_site_y) * 0.5, p.chroma_lo_y, p.chroma_hi_y, y0, y1, fy);
+        return vec3(luma,
+                    yuv_bilinear(1u, p.src_pitch1, 2u, 0u, x0, x1, y0, y1, fx, fy),
+                    yuv_bilinear(1u, p.src_pitch1, 2u, 1u, x0, x1, y0, y1, fx, fy));
+    }
+    return vec3(luma,
+                yuv_bilinear(1u, p.src_pitch1, 1u, 0u, x0, x1, y0, y1, fx, fy),
+                yuv_bilinear(2u, p.src_pitch2, 1u, 0u, x0, x1, y0, y1, fx, fy));
+}
+
+uint quantize(float v)
+{
+    return uint(clamp(floor(v + 0.5), 0.0, p.out_max));
+}
+
+// Output codes (and alpha) of the output sample at `q` (luma pixels).
+uvec4 pixel(vec2 q)
+{
+    if (q.x < p.dst_x0 || q.x >= p.dst_x1 || q.y < p.dst_y0 || q.y >= p.dst_y1)
+        return uvec4(p.bg0, p.bg1, p.bg2, p.bg_alpha);
+    vec2 pos = vec2(p.src_x + (q.x - p.dst_x0) * p.scale_x, p.src_y + (q.y - p.dst_y0) * p.scale_y);
+    vec3 c = sample_src(pos);
+    vec3 o = vec3(p.m[0] * c.x + p.m[1] * c.y + p.m[2] * c.z + p.m[3],
+                  p.m[4] * c.x + p.m[5] * c.y + p.m[6] * c.z + p.m[7],
+                  p.m[8] * c.x + p.m[9] * c.y + p.m[10] * c.z + p.m[11]);
+    return uvec4(quantize(o.x), quantize(o.y), quantize(o.z), 255u);
+}
+
+// Four samples of one row into a plane: one word (8-bit) or two (16-bit containers).
+void store4(uint plane, uint pitch, uint x0, uint y, uvec4 v)
+{
+    uint at = (y * pitch + x0 * p.dst_bps) >> 2;
+    v <<= p.dst_shift;
+    uint w0, w1 = 0u;
+    if (p.dst_bps == 1u) {
+        w0 = v.x | v.y << 8u | v.z << 16u | v.w << 24u;
+    } else {
+        w0 = v.x | v.y << 16u;
+        w1 = v.z | v.w << 16u;
+    }
+    if (plane == 0u) {
+        d0[at] = w0;
+        if (p.dst_bps == 2u)
+            d0[at + 1u] = w1;
+    } else if (plane == 1u) {
+        d1[at] = w0;
+        if (p.dst_bps == 2u)
+            d1[at + 1u] = w1;
+    } else {
+        d2[at] = w0;
+        if (p.dst_bps == 2u)
+            d2[at + 1u] = w1;
+    }
+}
+
+void main()
+{
+    uint x0 = gl_GlobalInvocationID.x * 4u;
+    uint y0 = gl_GlobalInvocationID.y * 2u;
+    if (x0 >= p.dst_width || y0 >= p.dst_height)
+        return;
+    for (uint r = 0u; r < 2u; r++) {
+        uint y = y0 + r;
+        if (y >= p.dst_height)
+            break;
+        uvec4 c0, c1, c2, a;
+        for (uint i = 0u; i < 4u; i++) {
+            uvec4 v = pixel(vec2(float(x0 + i) + 0.5, float(y) + 0.5));
+            c0[i] = v.x;
+            c1[i] = v.y;
+            c2[i] = v.z;
+            a[i] = v.w;
+        }
+        if (p.dst_kind == 2u) {
+            uint at = (y * p.dst_pitch0 + x0 * 4u) >> 2;
+            for (uint i = 0u; i < 4u; i++) {
+                uint first = p.dst_order == 0u ? c2[i] : c0[i];
+                uint third = p.dst_order == 0u ? c0[i] : c2[i];
+                d0[at + i] = first | c1[i] << 8u | third << 16u | a[i] << 24u;
+            }
+        } else {
+            store4(0u, p.dst_pitch0, x0, y, c0);
+            if (p.dst_kind == 1u) {
+                store4(1u, p.dst_pitch1, x0, y, c1);
+                store4(2u, p.dst_pitch2, x0, y, c2);
+            }
+        }
+    }
+    if (p.dst_kind == 0u) {
+        uint cy = y0 / 2u;
+        uvec4 uv;
+        for (uint j = 0u; j < 2u; j++) {
+            float k = float(x0 / 2u + j);
+            uvec4 v = pixel(vec2(2.0 * k + p.out_site_x, 2.0 * float(cy) + p.out_site_y));
+            uv[2u * j] = v.y;
+            uv[2u * j + 1u] = v.z;
+        }
+        store4(1u, p.dst_pitch1, x0, cy, uv);
+    }
+}

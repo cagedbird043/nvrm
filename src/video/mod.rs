@@ -31,6 +31,7 @@ pub mod venc;
 pub mod vc1;
 pub mod vp8;
 pub mod vp9;
+pub mod vpp;
 
 use crate::rm::{self, Client};
 use std::rc::Rc;

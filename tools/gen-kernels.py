@@ -27,7 +27,7 @@ OUT_RS = NATIVE / "src/video/kernels.rs"
 # compute.rs VALIDATED_CLASSES (hardware-tested); the rest only have unit-tested QMD packing.
 SMS = (75, 80, 86, 89, 90, 120)
 # (name, test-only): test kernels exist for the hardware tests of the engine itself.
-KERNELS = (("bgra_nv12", False), ("fill", True), ("mix", True))
+KERNELS = (("bgra_nv12", False), ("vpp", False), ("fill", True), ("mix", True))
 VARIABLES = ("program", "cbuf", "grid_x", "grid_y", "grid_z")
 ABI = 1
 

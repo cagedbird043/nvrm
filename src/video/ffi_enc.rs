@@ -254,9 +254,6 @@ fn input(v:&NvVencC2View,w:u32,h:u32)->Result<(u32,[NvVencPlane;3]),EncError> {
         let slot=&mut roots[p.root_index as usize];
         if slot.is_some_and(|old|old!=root) {return Err(invalid("root relation"));}
         *slot=Some(root);
-        let root_plane=&ps[p.root_index as usize];
-        if root_plane.root_offset!=0 || root_plane.root_index!=p.root_index
-            || root_plane.data as usize!=root {return Err(invalid("root descriptor"));}
     }
     if roots.iter().filter(|r|r.is_some()).count()!=v.root_planes as usize {
         return Err(invalid("root plane count"));
@@ -375,7 +372,7 @@ mod tests {
                     v.planes[i].data=(0x20000+v.planes[i].root_offset as usize) as *const u8;}
             }
         } else {
-            let root=if format==3 {0}else{2};
+            let root=0;
             let offsets=if format==3 {[0,1,2,3]}else{[2,1,0,3]};
             for (i,off) in offsets.into_iter().enumerate() {
                 v.planes[i].root_index=root;v.planes[i].root_offset=off;

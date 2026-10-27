@@ -11,6 +11,34 @@ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fenc
 HDR metadata of every picture that carries any; `NV_VIDEO_MEASURE_ACQUIRE=1` (AVC test)
 re-passes the previous release fence as the acquire fence and times the copy_out call.
 
+## Codec2 解码驱动 ABI
+
+`nv_c2_dec.h` 的 `nv_c2_dec_*` 由 `src/video/{c2_dec,ffi_dec,c2_layout}.rs` 实现。
+调用方串行化会话，提供同步 fetch/discard；Rust 借用设备与 dma-buf，拥有复制后的 CSD、
+待输出 picture、未 poll 的 cookie 与 fence。每次 queue/drain/flush（包括失败）之后必须 poll 到空，
+再通知上层错误；致命错误后只允许 poll/destroy。队列结果独立报告 consumed 与 blocked，
+不能将已消费但输出池阻塞的输入重送。2 MiB 启动/回放 CSD 整体拒绝；空输入接受 NULL。
+
+同一输入的多张显示帧保留同一 index/时间戳，前面的事件 `final_for_index=0`，
+C++ 外壳以输出专用 `FLAG_INCOMPLETE` 克隆发出；最后一个事件完成原工作。
+EOS 仅出现在最后事件；flush 返回原工作前丢弃所有事件资源，不附带像素。
+resize 先排旧会话输出，再按最大所需尺寸重建并回放 AVC/HEVC CSD。
+
+gralloc 外壳先验证 native header（12 字节版本、1–5 fd、35 个 32 位 payload 字），
+再复制 POD；Rust 校验 plane/fd、格式、几何、步长与范围。YV12 只允许 LINEAR；
+NV12/P010 保留 NVIDIA block-linear 路径，具体 copy class 由底层 copy_out 再校验。
+UV 偏移按分配器描述保留，不按 Y 平面大小重算；元数据 fd 不作图像平面。
+
+宿主测试：`cargo test`；`media/Makefile` 的 `test realtest-all smoke realenc`。
+`make superframe-test` 生成两个连续 VP9 显示帧的 superframe，校验索引字节，
+并在 NV12/YV12、池大小 1/8、独立/随最后输入 EOS 的八种组合中检查 60 张图像与不完整/最终事件。
+生成的 `media/out/host/superframe/vp9.mp4` 与 `pair.bin` 用于 guest：
+`c2_smoke vp9.mp4 c2.nvprolapse.vp9.decoder superframe pair.bin`，
+`c2_surface_smoke vp9.mp4 c2.nvprolapse.vp9.decoder pair.bin`。
+两个客户端核对 fixture 与前两个 extractor sample 一致，断言它们合成的一个输入产生两个同时间戳输出，
+并检查全片段 60 帧、EOS 与无错误；Surface 另检查 60 张 PRIVATE Image。
+
+
 ## 外部参数前端（VA-API）
 
 Rust 调用方可用 `Session::with_codec` 注入 `CodecDecoder`，由客户端提供已经解析的

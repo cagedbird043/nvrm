@@ -46,6 +46,7 @@ pub struct NvVideoSessionInfo {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NvVideoPicture {
     pub id: u64,
     pub timestamp: u64,
@@ -113,6 +114,7 @@ impl From<HdrStaticMetadata> for NvVideoHdrMetadata {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NvVideoTarget {
     pub dmabuf_fd: [i32; 2],
     pub offset: [u64; 2],

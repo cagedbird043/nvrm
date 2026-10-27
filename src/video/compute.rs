@@ -225,6 +225,7 @@ impl ComputeEngine {
         Ok(address)
     }
 
+    #[cfg(test)]
     /// Forgets every program so the next ones are written from the start of the code heap again
     /// (same addresses, new code). Waits for every launch first.
     pub(crate) fn reset_code(&mut self, drm: i32) -> VResult<()> {
@@ -369,7 +370,7 @@ mod tests {
     use crate::video::kernels::{ABI, KERNELS, QMD_SAMPLES, TEST_KERNELS};
 
     fn test_kernel(name: &str, sm: u32) -> &'static Kernel {
-        TEST_KERNELS.iter().find(|k| k.name == name && k.sm == sm).unwrap()
+        KERNELS.iter().chain(TEST_KERNELS).find(|k| k.name == name && k.sm == sm).unwrap()
     }
 
     /// The runtime packing reproduces Mesa's nak_fill_qmd for every shader model and QMD

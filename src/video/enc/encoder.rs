@@ -805,14 +805,29 @@ impl Encoder {
         let ingest = self.ingest.as_mut().unwrap();
         ingest.copy(&self.rm, key, src, &dst)
     }
-    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4): the
-    /// copy engine brings the visible region into a pitch-linear staging buffer and the CPU converts
-    /// it with [`Encoder::load_bgra`]. This GPU has no compute path here, so colour conversion
-    /// is the one step that still touches pixels on the CPU.
+    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4). With
+    /// validated compute kernels the GPU converts it into the slot (see
+    /// [`ingest::Ingest::bgra_to_nv12`]); otherwise the copy engine brings the visible region into
+    /// a pitch-linear staging buffer and the CPU converts it with [`Encoder::load_bgra`]. Both
+    /// produce the same bytes.
     pub fn load_dmabuf_bgra(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
-        self.input_slot()?;
+        let ds = self.input_slot()?;
         if src.bytes_per_sample != 4 || self.bps != 1 || self.cfg.chroma444 {
             return Err(invalid("BGRA dma-buf needs an 8-bit 4:2:0 encoder"));
+        }
+        self.aq_valid[ds] = false;
+        if self.ingest.is_none() {
+            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
+        }
+        let tiled = ingest::Destination::Tiled {
+            luma: self.input[ds].gpu,
+            chroma: self.input[ds].gpu + self.luma_sz as u64,
+            pitch: (self.pitch * self.bps) as u32,
+            width: self.cfg.width as u32,
+            height: self.cfg.height as u32,
+        };
+        if self.ingest.as_mut().unwrap().bgra_to_nv12(&self.rm, key, src, &tiled)? {
+            return Ok(());
         }
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let pitch = up(w * 4, 64);
@@ -825,11 +840,7 @@ impl Encoder {
             width: w as u32,
             height: h as u32,
         };
-        if self.ingest.is_none() {
-            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
-        }
-        let ingest = self.ingest.as_mut().unwrap();
-        ingest.copy(&self.rm, key, src, &dst)?;
+        self.ingest.as_mut().unwrap().copy(&self.rm, key, src, &dst)?;
         let stage = std::mem::take(&mut self.stage);
         let result = self.load_bgra(&stage.bytes()[..pitch * h], pitch);
         self.stage = stage;

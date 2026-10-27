@@ -23,11 +23,11 @@ GEN = ROOT / "build/nak-host/src/nouveau/native-bridge/nv-nak-gen"
 MESA_PIN = "ddaf85e353442d9d7f192fdcf1823e652e3f2ee3"  # compiler/build.py PIN (mesa-26.2.5)
 SHADERS = NATIVE / "shaders"
 OUT_RS = NATIVE / "src/video/kernels.rs"
-# Shader models with generated kernels. Runtime use is further limited to the models in
-# compute.rs VALIDATED_SM (hardware-tested); the rest only have unit-tested QMD packing.
+# Shader models with generated kernels. Runtime use is further limited to the compute classes in
+# compute.rs VALIDATED_CLASSES (hardware-tested); the rest only have unit-tested QMD packing.
 SMS = (75, 80, 86, 89, 90, 120)
 # (name, test-only): test kernels exist for the hardware tests of the engine itself.
-KERNELS = (("fill", True), ("mix", True))
+KERNELS = (("bgra_nv12", False), ("fill", True), ("mix", True))
 VARIABLES = ("program", "cbuf", "grid_x", "grid_y", "grid_z")
 ABI = 1
 

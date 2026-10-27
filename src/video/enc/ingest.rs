@@ -9,7 +9,8 @@
 //! encoder's own address space once per key and stay mapped until [`Ingest::forget`].
 use super::super::{
     channel::wait_sync_file,
-    session::{vram, CopyEngine},
+    compute::ComputeEngine,
+    session::{vram, CopyEngine, VramBuffer},
     VResult, VideoError,
 };
 use crate::{
@@ -75,6 +76,10 @@ struct Import {
 pub(crate) struct Ingest {
     engine: CopyEngine,
     imports: HashMap<u64, Vec<Import>>,
+    /// BGRA conversion: the compute engine (`None` inside: this GPU has no validated kernels)
+    /// and the VRAM scratch for the linear BGRA copy and the linear NV12 result.
+    compute: Option<Option<ComputeEngine>>,
+    scratch: Option<(VramBuffer, usize)>,
 }
 
 /// Destination of a copy: both planes of one NVENC input slot (block linear, two GOBs high; the
@@ -95,7 +100,91 @@ impl Ingest {
         Ok(Self {
             engine: CopyEngine::new(&rm.device, &rm.space)?,
             imports: HashMap::new(),
+            compute: None,
+            scratch: None,
         })
+    }
+
+    /// Converts a one-plane BGRA `source` (bytes B, G, R, A/X) into the tiled NV12 slot `dst` on
+    /// the GPU: the copy engine brings the visible region into a linear VRAM scratch, the
+    /// `bgra_nv12` kernel converts it there (bit-exact with the CPU conversion), and the copy
+    /// engine tiles luma and CbCr into the slot. No pixel crosses the CPU. Returns `Ok(false)`,
+    /// having done nothing, when this GPU's compute kernels are not validated.
+    pub fn bgra_to_nv12(
+        &mut self,
+        rm: &super::super::venc::NvVencDevice,
+        key: u64,
+        source: &Source,
+        dst: &Destination,
+    ) -> VResult<bool> {
+        let &Destination::Tiled { luma, chroma, pitch, width, height } = dst else {
+            return Err(VideoError::Invalid("BGRA conversion needs a tiled NVENC slot".into()));
+        };
+        if self.compute.is_none() {
+            self.compute = Some(match ComputeEngine::supported(&rm.device)? {
+                Some(_) => Some(ComputeEngine::new(&rm.device, &rm.space)?),
+                None => None,
+            });
+        }
+        if self.compute.as_ref().is_some_and(|c| c.is_none()) {
+            return Ok(false);
+        }
+        let (w, h) = (width as usize, height as usize);
+        let even = (w + 1) & !1;
+        let src_pitch = (w * 4).next_multiple_of(64);
+        let luma_pitch = w.next_multiple_of(64);
+        let chroma_pitch = even.next_multiple_of(64);
+        let luma_at = (src_pitch * h).next_multiple_of(256);
+        let chroma_at = (luma_at + luma_pitch * h).next_multiple_of(256);
+        let bytes = chroma_at + chroma_pitch * h.div_ceil(2);
+        if self.scratch.as_ref().is_none_or(|s| s.1 < bytes) {
+            self.scratch = None;
+            let size = bytes.next_multiple_of(1 << 16);
+            self.scratch = Some((vram(&rm.device, &rm.space, size)?, size));
+        }
+        let base = self.scratch.as_ref().unwrap().0.gpu.address();
+        let linear = Destination::Linear { address: base, pitch: src_pitch as u32, width, height };
+        self.copy(rm, key, source, &linear)?;
+
+        let compute = self.compute.as_mut().unwrap().as_mut().unwrap();
+        let kernel = compute.kernel("bgra_nv12")?;
+        let push: Vec<u8> = [width, height, src_pitch as u32, luma_pitch as u32, chroma_pitch as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let bindings = [
+            (0, base, (src_pitch * h) as u32),
+            (1, base + luma_at as u64, (luma_pitch * h) as u32),
+            (2, base + chroma_at as u64, (chroma_pitch * h.div_ceil(2)) as u32),
+        ];
+        let groups = [
+            (w.div_ceil(4) as u32).div_ceil(kernel.workgroup[0]),
+            (h.div_ceil(2) as u32).div_ceil(kernel.workgroup[1]),
+            1,
+        ];
+        let token = compute.launch(&rm.space, kernel, &bindings, &push, groups)?;
+        compute.wait(rm.drm.as_raw_fd(), token)?;
+
+        let mut words = Vec::with_capacity(48);
+        method(&mut words, 4, 0, &[self.engine.copy_class]); // SET_OBJECT
+        for (at, line_pitch, line, rows, slot) in [
+            (luma_at, luma_pitch, w, h, luma),
+            (chroma_at, chroma_pitch, even, h.div_ceil(2), chroma),
+        ] {
+            let plane = Plane { fd: -1, offset: at as u64, pitch: line_pitch as u32 };
+            Self::rectangle(
+                &mut words,
+                Layout::Linear,
+                &plane,
+                base + at as u64,
+                Target::Tiled(slot, pitch),
+                line as u32,
+                rows as u32,
+                bytes as u64,
+            )?;
+        }
+        self.run(rm, &words)?;
+        Ok(true)
     }
 
     pub fn forget(&mut self, key: u64) {
@@ -574,5 +663,91 @@ mod tests {
             }
         }
         eprintln!("{cases} cases byte-exact");
+    }
+
+    /// Stage-3 acceptance: the GPU BGRA conversion (`bgra_to_nv12`) writes the NVENC input slot
+    /// byte for byte as the CPU conversion of the encoder's fallback (`layout::in_tile_bgra`),
+    /// padding included. Patterns: per-channel extremes, solid colours, a chroma checkerboard and
+    /// a pseudo-random image whose X/A byte is garbage; sizes odd and even, crossing tile and
+    /// GOB boundaries; linear sources with padded pitches and block-linear ones.
+    #[test]
+    #[ignore = "local NVIDIA GPU: compute BGRA -> NV12 into a tiled NVENC input slot"]
+    fn bgra_to_nv12_matches_cpu() {
+        use crate::video::{enc::layout::in_tile_bgra, session::vram, venc::NvVencDevice};
+        let rm = NvVencDevice::open_on(None).unwrap();
+        let mut ingest = Ingest::new(&rm).unwrap();
+        let up = |v: usize, a: usize| v.div_ceil(a) * a;
+        let patterns: [(&str, fn(usize, usize, usize) -> [u8; 4]); 5] = [
+            ("extremes", |x, y, _| {
+                let v = |b: usize| if (x >> b ^ y) & 1 == 0 { 0 } else { 255 };
+                [v(0), v(1), v(2), 0x5a]
+            }),
+            ("white", |_, _, _| [255, 255, 255, 255]),
+            ("red", |_, _, _| [0, 0, 255, 0]),
+            ("chroma checker", |x, y, _| if (x ^ y) & 1 == 0 { [255, 0, 0, 0] } else { [0, 0, 255, 0] }),
+            ("noise", |x, y, s| {
+                let h = ((x * 0x9e37_79b1 ^ y * 0x85eb_ca77 ^ s * 0xc2b2_ae3d) as u32).wrapping_mul(0x27d4_eb2f);
+                h.to_le_bytes()
+            }),
+        ];
+        let mut cases = 0;
+        for (w, h) in [(1usize, 1usize), (3, 5), (64, 16), (70, 37), (642, 362), (1920, 1080)] {
+            for layout in [Layout::Linear, Layout::BlockLinear { log2_height: 1 }, Layout::BlockLinear { log2_height: 4 }] {
+                for extra in [0usize, 128] {
+                    let (src_pitch, src_rows) = match layout {
+                        Layout::Linear => (up(w * 4, 64) + extra, h),
+                        Layout::BlockLinear { log2_height } => (up(w * 4, 64) + extra, up(h, 8 << log2_height)),
+                    };
+                    let size = up(src_pitch * src_rows, 1 << 16);
+                    let memory = rm.device.allocate_vram(size).unwrap();
+                    let mut map = memory.map().unwrap();
+                    let fd = crate::external::export(&memory, rm.drm.as_fd()).unwrap();
+                    let pitch = up(w, 64);
+                    let luma_sz = pitch * up(h, 32);
+                    let slot_sz = luma_sz + pitch * up(h.div_ceil(2), 16);
+                    for (name, pattern) in &patterns {
+                        let mut image = vec![0u8; size];
+                        let mut linear = vec![0u8; w * 4 * h];
+                        for y in 0..h {
+                            for x in 0..w {
+                                let px = pattern(x, y, cases);
+                                linear[(y * w + x) * 4..][..4].copy_from_slice(&px);
+                                for (k, b) in px.iter().enumerate() {
+                                    let o = match layout {
+                                        Layout::Linear => y * src_pitch + x * 4 + k,
+                                        Layout::BlockLinear { log2_height } => bl_offset(x * 4 + k, y, src_pitch, log2_height),
+                                    };
+                                    image[o] = *b;
+                                }
+                            }
+                        }
+                        for (i, c) in image.chunks(4).enumerate() {
+                            map.write_u32(i * 4, u32::from_le_bytes(c.try_into().unwrap())).unwrap();
+                        }
+                        crate::platform::device_full_barrier();
+                        let plane = Plane { fd: fd.as_raw_fd(), offset: 0, pitch: src_pitch as u32 };
+                        let source = Source { planes: [plane; 3], layout, bytes_per_sample: 4, chroma444: false };
+                        let slot = vram(&rm.device, &rm.space, slot_sz).unwrap();
+                        let dst = Destination::Tiled {
+                            luma: slot.gpu.address(),
+                            chroma: slot.gpu.address() + luma_sz as u64,
+                            pitch: pitch as u32,
+                            width: w as u32,
+                            height: h as u32,
+                        };
+                        assert!(ingest.bgra_to_nv12(&rm, cases as u64 + 1, &source, &dst).unwrap(), "compute not available");
+                        ingest.forget(cases as u64 + 1);
+                        let got = get(&slot, slot_sz);
+                        let mut want = vec![0u8; slot_sz];
+                        let (l, c) = want.split_at_mut(luma_sz);
+                        in_tile_bgra(l, c, &linear, w * 4, w, h, pitch);
+                        let tag = format!("{name} {w}x{h} {layout:?} pitch {src_pitch}");
+                        assert_eq!(first_mismatch(&got, &want), None, "{tag}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("{cases} BGRA cases byte-exact with the CPU conversion");
     }
 }

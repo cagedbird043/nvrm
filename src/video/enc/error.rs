@@ -6,9 +6,11 @@ pub enum EncError {
     InvalidInputPlane { plane: usize, reason: &'static str },
     InputSlotsBusy,
     InvalidUpdate { field: &'static str },
+    InvalidConfig { field: &'static str },
+    UnsupportedConfig { feature: &'static str },
     DeviceOpen { source: VideoError },
-    ChannelSubmit { source: VideoError },
-    Completion { ticket: u32, source: VideoError },
+    ResourceInit { resource: &'static str, source: VideoError },
+    ChannelInit { stage: &'static str, source: VideoError },
     ChannelOperation { stage: &'static str, source: VideoError },
     PutReadbackMismatch { expected: u32, observed: u32 },
     ChannelTimeout { ticket: u64 },
@@ -40,6 +42,14 @@ impl std::fmt::Display for EncError {
 impl std::error::Error for EncError {}
 impl From<EncError> for VideoError {
     fn from(e: EncError) -> Self {
-        if e.recoverable() { Self::Invalid(e.to_string()) } else { Self::DeviceLost(e.to_string()) }
+        match e {
+            EncError::UnsupportedConfig {feature} => Self::Unsupported(feature.into()),
+            EncError::ResourceInit {source:VideoError::NoMemory(message),..} => Self::NoMemory(message),
+            _ if e.recoverable() => Self::Invalid(e.to_string()),
+            _ => Self::DeviceLost(e.to_string()),
+        }
     }
+}
+impl From<VideoError> for EncError {
+    fn from(source:VideoError)->Self {Self::ResourceInit {resource:"encoder allocation/mapping",source}}
 }

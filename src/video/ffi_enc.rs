@@ -143,10 +143,11 @@ unsafe extern "C" fn nv_venc_sess_create(c: *const NvVencSessCfg, out: *mut *mut
     unsafe { *out = ptr::null_mut(); }
     let status = pure(|| {
         let c = unsafe { c.as_ref() }.ok_or(invalid("null config"))?;
-        let cfg=config(c)?;
-        let encoder=Encoder::open_on(&cfg, if c.pci_present!=0 {
-            Some([c.pci_domain,c.pci_bus,c.pci_device,c.pci_function]) } else {None})
-            .map_err(|source| EncError::DeviceOpen {source})?;
+        let cfg=config(c).map_err(|e|match e {
+            EncError::InvalidUpdate {field}=>EncError::InvalidConfig {field},other=>other,
+        })?;
+        let encoder=Encoder::open_checked(&cfg, if c.pci_present!=0 {
+            Some([c.pci_domain,c.pci_bus,c.pci_device,c.pci_function]) } else {None})?;
         let mut config=Vec::new();
         config.try_reserve_exact(65536).map_err(|_| EncError::OutputAssemblyCapacity)?;
         if c.codec==2 { encoder.av1_config(&mut config); } else { encoder.headers(&mut config); }

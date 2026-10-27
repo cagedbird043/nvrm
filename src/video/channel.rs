@@ -327,6 +327,14 @@ impl Drop for EngineChannel {
 mod tests {
     use super::nvdec_usermode_class;
     #[test]
+    fn fence_timeout_keeps_structured_ticket() {
+        use std::os::fd::AsRawFd;
+        let (reader,_writer)=std::os::unix::net::UnixStream::pair().unwrap();
+        let e=super::wait_sync_file_enc(reader.as_raw_fd(),std::time::Duration::ZERO,42).unwrap_err();
+        assert!(matches!(e,crate::video::enc::EncError::ChannelTimeout {ticket:42}));
+        assert!(!e.recoverable());
+    }
+    #[test]
     fn usermode_class_matches_stock_per_generation() {
         // Usermode subsets of the per-generation class lists (0xc361 allocated
         // by stock on GA106/550 and AD102/610, 0xc661 on GB202/615 in rmtrace).

@@ -266,12 +266,15 @@ impl Encoder {
         Self::open_on(cfg, None)
     }
     pub fn open_on(cfg: &EncConfig, pci: Option<[u32; 4]>) -> VResult<Self> {
+        Self::open_checked(cfg,pci).map_err(Into::into)
+    }
+    pub(crate) fn open_checked(cfg:&EncConfig,pci:Option<[u32;4]>)->Result<Self,EncError> {
         // The host C core's rm_shim.c chan_create supports NVENC0 only.
         if cfg.engine != 0 {
-            return Err(VideoError::Unsupported("only NVENC0 is supported".into()));
+            return Err(EncError::UnsupportedConfig {feature:"only NVENC0 is supported"});
         }
         if cfg.width <= 0 || cfg.height <= 0 {
-            return Err(invalid("non-positive encode dimensions"));
+            return Err(EncError::InvalidConfig {field:"dimensions"});
         }
         let mut c = cfg.clone();
         c.num_refs = c.num_refs.clamp(1, if c.codec == ENC_AV1 { 4 } else { 3 });
@@ -287,7 +290,7 @@ impl Encoder {
             c.qp_p = 0;
             c.rc_mode = 0;
         }
-        let mut rm = NvVencDevice::open_on(pci)?;
+        let mut rm = NvVencDevice::open_on(pci).map_err(|source|EncError::DeviceOpen {source})?;
         let class = rm
             .classes
             .iter()
@@ -298,9 +301,7 @@ impl Encoder {
         let hevc = c.codec == ENC_HEVC;
         let av1 = c.codec == ENC_AV1;
         if av1 && class != 0xc9b7 {
-            return Err(VideoError::Unsupported(format!(
-                "this GPU's NVENC (class {class:#x}) has no AV1"
-            )));
+            return Err(EncError::UnsupportedConfig {feature:"GPU NVENC class has no AV1"});
         }
         if (!hevc && !av1) || c.bit_depth != 10 {
             c.bit_depth = 8;
@@ -473,7 +474,8 @@ impl Encoder {
             ps.nal_cpb_fullness = (0.5 * c.vbv_bits as f64 * 16.0) as i32;
             ps.vcl_cpb_fullness = ps.nal_cpb_fullness;
         }
-        let chan = EngineChannel::new(&rm.device, &rm.space, NV2080_ENGINE_TYPE_NVENC0, class, 0)?;
+        let chan = EngineChannel::new(&rm.device, &rm.space, NV2080_ENGINE_TYPE_NVENC0, class, 0)
+            .map_err(|source|EncError::ChannelInit {stage:"channel/timeline construction",source})?;
         let av1_hq = av1 && (cfg.quality || cfg.bframes > 0);
         let assembly_capacity = bs[0].size.checked_mul(2).and_then(|n| n.checked_add(65536))
             .ok_or_else(|| VideoError::NoMemory("encoder assembly size overflow".into()))?;
@@ -484,6 +486,11 @@ impl Encoder {
         conversion_scratch.try_reserve_exact(up(w * 2,64) * 48)
             .map_err(|e|VideoError::NoMemory(e.to_string()))?;
         conversion_scratch.resize(up(w * 2,64) * 48,0);
+        let mut av1_hid=Vec::new();
+        if av1 && c.bframes>0 {
+            av1_hid.try_reserve_exact(bs[0].size+65536)
+                .map_err(|e|VideoError::NoMemory(e.to_string()))?;
+        }
         Ok(Self {
             chan,
             ingest: None,
@@ -539,11 +546,7 @@ impl Encoder {
             conversion_scratch,
             #[cfg(test)]
             completion_fault: 0,
-            av1_hid: if av1 {
-                Vec::with_capacity(bs_capacity(mbs))
-            } else {
-                Vec::new()
-            },
+            av1_hid,
             av1_hid_slot: 0,
             av1_hid_disp: -1,
             av1_last_shown: -1,
@@ -941,9 +944,6 @@ impl Encoder {
         );
         Ok(())
     }
-}
-fn bs_capacity(mbs: usize) -> usize {
-    up(mbs * 384 + (1 << 20), 65536) + 4096
 }
 fn tile_widened(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize, pitch: usize) {
     for r in 0..h {
@@ -2266,7 +2266,8 @@ impl Encoder {
             *tile = off.checked_add(size).and_then(|end| bs.get(off..end))
                 .ok_or(EncError::Av1TileRange { tile: i, offset: off, bytes: size, capacity: bs.len() })?;
         }
-        let required = tiles[..nt].iter().try_fold(self.av1_hid.len() + 65536usize,
+        let prefix=if fp.hidden {0}else{self.av1_hid.len()};
+        let required = tiles[..nt].iter().try_fold(prefix + 65536usize,
             |sum, tile| sum.checked_add(tile.len())).ok_or(EncError::OutputAssemblyCapacity)?;
         if out.capacity() < required || (fp.hidden && self.av1_hid.capacity() < required) {
             return Err(EncError::OutputAssemblyCapacity);

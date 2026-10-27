@@ -191,12 +191,11 @@ NVK_PATCH_LIST = [
     # A 3D view of a 2D image (invalid usage NVIDIA's driver accepts) is
     # described as a depth-1 3D image instead of tripping nil's assert.
     HERE / "nvk-3d-view-of-2d-image.patch",
-    # Blackwell B: colour-attachment output -> fragment reads drain with
-    # PIXEL_SHADER_BARRIER instead of WAIT_FOR_IDLE, and QMDs carry
-    # CWD_MEMBAR_TYPE = L1_MEMBAR, as NVIDIA's driver does.
+    # Colour-attachment output -> fragment reads drain with
+    # PIXEL_SHADER_BARRIER on every 3D class; Turing+ QMDs carry L1_MEMBAR.
     HERE / "nvk-pixel-shader-barrier.patch",
     HERE / "nak-qmd-cwd-membar.patch",
-    # Blackwell B: compute -> compute barriers order through QMD
+    # Ampere B..Blackwell B: compute barriers order through QMD
     # dependencies (an empty join QMD per barrier, host dependency
     # decrements) instead of WAIT_FOR_IDLE, as NVIDIA's driver does.
     HERE / "nak-qmd-dependency.patch",
@@ -222,6 +221,8 @@ NVK_PATCH_LIST = [
     # Shared SKED cache invalidation and compute classes without MME.
     HERE / "nvk-turing-sked-qmd-invalidate.patch",
     HERE / "nvk-compute-queue-no-mme.patch",
+    # Compute-only indirect copies read commands through GPU-only pool blocks.
+    HERE / "nvk-compute-queue-copy-memory-indirect.patch",
 ]
 # NVK and GL consume exactly the same ordered stack.
 NVK_PATCHES = tuple(patch.name for patch in NVK_PATCH_LIST)

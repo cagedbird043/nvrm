@@ -1,0 +1,12 @@
+// Test kernel for the video compute engine, a different program from fill.comp:
+// data[i] = (seed ^ i) * 3 + data[i] for i < count, over a 2D grid of 8x8 workgroups.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1, std430) buffer Out { uint data[]; };
+layout(push_constant) uniform Push { uint count; uint seed; uint pitch; } p;
+void main()
+{
+    uint i = gl_GlobalInvocationID.y * p.pitch + gl_GlobalInvocationID.x;
+    if (gl_GlobalInvocationID.x < p.pitch && i < p.count)
+        data[i] = (p.seed ^ i) * 3u + data[i];
+}

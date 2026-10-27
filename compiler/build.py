@@ -57,7 +57,7 @@ def main():
         run(["git", "-C", SOURCE, "apply", patch])
     bridge = SOURCE / "src/nouveau/native-bridge"
     bridge.mkdir(exist_ok=True)
-    for file in ("nv_nak.h", "nv_nak.c", "check.c", "meson.build"):
+    for file in ("nv_nak.h", "nv_nak_build.h", "nv_nak.c", "check.c", "gen.c", "meson.build"):
         shutil.copy2(HERE / file, bridge / file)
 
     common = ["-Dvulkan-drivers=nouveau", "-Dgallium-drivers=", "-Dplatforms=", "-Dglx=disabled",
@@ -107,7 +107,10 @@ endian = 'little'
         else:
             run(setup, env=target_env)
         cc_launcher.record(build)
-        run(["ninja", "-C", build, "src/nouveau/native-bridge/libnv_native_nak.so", "src/nouveau/native-bridge/nv-nak-check", "-j", args.j, *ninja_load()], env=target_env)
+        targets_built = ["src/nouveau/native-bridge/libnv_native_nak.so", "src/nouveau/native-bridge/nv-nak-check"]
+        if target == "host":  # the kernel generator runs at build time only
+            targets_built.append("src/nouveau/native-bridge/nv-nak-gen")
+        run(["ninja", "-C", build, *targets_built, "-j", args.j, *ninja_load()], env=target_env)
         print(f"Built {target}: {build}/src/nouveau/native-bridge/libnv_native_nak.so")
 
 if __name__ == "__main__":

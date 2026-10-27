@@ -2,10 +2,12 @@
 
 `nv_nak.c` converts a supplied SPIR-V compute entrypoint into NIR, lowers the
 native driver's buffer/push-constant ABI, and invokes Mesa's Rust NAK compiler
-for SM120. It compiles the actual supplied program in-process. There is no
-fixed-shader matching, PTX compilation, CUDA/NVRTC, or proprietary userspace
-dependency. The adapter is C because Mesa exposes NIR passes through its C ABI;
-NAK itself and the native GPU backend are Rust.
+for shader model 75, 80, 86, 89, 90 or 120 (`nv_nak_device` gives NAK the device
+fields Mesa's winsys derives for that SM). It compiles the actual supplied program
+in-process. There is no fixed-shader matching, PTX compilation, CUDA/NVRTC, or
+proprietary userspace dependency. The adapter is C because Mesa exposes NIR passes
+through its C ABI; NAK itself and the native GPU backend are Rust. The runtime
+Vulkan prototype only uses SM120.
 
 ## Build
 
@@ -73,7 +75,7 @@ go through Mesa/NAK; this is not a claim that every such combination has been
 hardware tested. The runtime checks shader resource requirements separately.
 Current dispatch has no base-workgroup offset, so base system values lower to
 zero. `NumWorkgroups`, images/samplers, UBOs, descriptor arrays, specialization
-constants, other stages and other shader models are unsupported. Buffer length
+constants, constant data and other stages are unsupported. Buffer length
 records are reserved for later bounds lowering; robustBufferAccess is not
 implemented by this bridge. Valid Vulkan programs must keep accesses in bounds.
 
@@ -96,6 +98,20 @@ generate: 272 code bytes, transform: 400; 19 GPRs each, local/shared/barriers 0,
 workgroup 64x1x1. Parent driver verification additionally executes these programs
 on the GPU through Vulkan. Compiler-only checks do not establish rendering,
 Android app sandbox compatibility, or Vulkan conformance.
+
+## Kernel generator
+
+`gen.c` (`nv-nak-gen`, host build only) compiles one SPIR-V entrypoint for one
+shader model through the same `nv_nak_build` and prints JSON: the SASS, resource
+metadata, a QMD template filled by Mesa's `nak_fill_qmd`, and the bit runs that
+carry the per-launch program address, cbuf 0 address and grid size. The runs are
+measured from `nak_fill_qmd` one input bit at a time and checked against it on 64
+combined launches; it refuses shaders needing local memory, a CRS stack or constant
+data. `tools/gen-kernels.py` runs it for every kernel in `shaders/` and shader
+model, writing `shaders/sm<sm>/<name>.bin` and `src/video/kernels.rs` for the video
+compute engine (`src/video/compute.rs`); `--check` verifies the committed files are
+byte-identical to a regeneration. Run it inside `localhost/nvk-native-a17` with the
+repository at `/work`, after `compiler/build.py --target host`.
 
 ## Source anchors and licensing
 

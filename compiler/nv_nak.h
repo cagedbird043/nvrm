@@ -21,7 +21,8 @@ struct nv_nak_result {
 };
 /* 0 success, -1 invalid/unsupported or compile failure. out is zeroed on error.
  * error is NUL-terminated when error_size>0. Allocation belongs to the bridge.
- * All inputs are borrowed for this call. sm must currently equal 120.
+ * All inputs are borrowed for this call. sm: 75, 80, 86, 89, 90 or 120; shaders with
+ * constant data are refused (no buffer for it in this ABI).
  * Callers must serialize compiler calls (Mesa global GLSL type cache). */
 int nv_nak_compile(const uint32_t *spirv, size_t word_count,
                    const char *entrypoint, uint32_t sm,

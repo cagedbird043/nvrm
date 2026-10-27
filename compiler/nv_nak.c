@@ -4,6 +4,7 @@
  * with a deliberately small, explicitly documented root table ABI.
  */
 #include "nv_nak.h"
+#include "nv_nak_build.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -86,26 +87,55 @@ static void shared_layout(const struct glsl_type *type, unsigned *size, unsigned
     *alignment = component;
 }
 
-EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
-                           const char *entry, uint32_t sm,
-                           struct nv_nak_result *out, char *error, size_t capacity)
+/* The nv_device_info fields NAK reads (api.rs: sm, max_warps_per_mp; qmd.rs: cls_compute,
+ * max_smem_per_wg_kB, sm_smem_sizes_kB) for each supported shader model, with the values
+ * Mesa's winsys derives for that SM (nouveau_device.c: max_warps_per_mp_for_sm,
+ * init_shared_mem_sizes; compute classes from the NVIDIA class headers). */
+int nv_nak_device(uint32_t sm, struct nv_device_info *dev)
 {
-    if (capacity && !error) return -1;
+    static const uint16_t ampere[10] = { 0, 8, 16, 32, 64, 100, 132, 164, 196, 228 };
+    memset(dev, 0, sizeof(*dev));
+    dev->sm = sm;
+    switch (sm) {
+    case 75:  dev->cls_compute = 0xc5c0; dev->max_warps_per_mp = 32; break;
+    case 80:  dev->cls_compute = 0xc6c0; dev->max_warps_per_mp = 64; dev->sm_smem_size_count = 8; break;
+    case 86:  dev->cls_compute = 0xc7c0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
+    case 89:  dev->cls_compute = 0xc9c0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
+    case 90:  dev->cls_compute = 0xcbc0; dev->max_warps_per_mp = 64; dev->sm_smem_size_count = 10; break;
+    case 120: dev->cls_compute = 0xcec0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
+    default: return -1;
+    }
+    if (sm == 75) {
+        dev->sm_smem_sizes_kB[0] = 32;
+        dev->sm_smem_sizes_kB[1] = 64;
+        dev->sm_smem_size_count = 2;
+    } else {
+        memcpy(dev->sm_smem_sizes_kB, ampere, sizeof(ampere[0]) * dev->sm_smem_size_count);
+    }
+    dev->max_smem_per_wg_kB = dev->sm_smem_sizes_kB[dev->sm_smem_size_count - 1];
+    return 0;
+}
+
+/* Compiles one SPIR-V compute entrypoint for `dev`. On success returns the NAK binary (destroy
+ * with nak_shader_bin_destroy) and the size of the shader's constant data, which this ABI has
+ * no buffer for. On failure returns NULL with a diagnostic in `error`. */
+struct nak_shader_bin *nv_nak_build(const uint32_t *words, size_t count, const char *entry,
+                                    const struct nv_device_info *dev, uint32_t *constant_bytes,
+                                    char *error, size_t capacity)
+{
     if (capacity) error[0] = 0;
     struct lowering state = { error, capacity, false };
-    if (!out) return -1;
-    memset(out, 0, sizeof(*out));
-    if (!words || count < 5 || words[0] != 0x07230203 || !entry || sm != 120) {
-        fail(&state, "Expected SPIR-V compute module and shader model 120"); return -1;
+    struct nak_shader_bin *bin = NULL;
+    if (!words || count < 5 || words[0] != 0x07230203 || !entry) {
+        fail(&state, "Expected a SPIR-V compute module"); return NULL;
     }
     for (size_t i = 5; i < count;) {
         size_t n = words[i] >> 16;
-        if (!n || n > count - i) { fail(&state, "Truncated SPIR-V instruction"); return -1; }
+        if (!n || n > count - i) { fail(&state, "Truncated SPIR-V instruction"); return NULL; }
         i += n;
     }
     glsl_type_singleton_init_or_ref();
-    struct nv_device_info dev = { .sm = 120, .max_warps_per_mp = 48 };
-    struct nak_compiler *nak = nak_compiler_create(&dev);
+    struct nak_compiler *nak = nak_compiler_create(dev);
     struct spirv_to_nir_options options = {
         .environment = NIR_SPIRV_VULKAN,
         .ssbo_addr_format = nir_address_format_64bit_global,
@@ -145,10 +175,41 @@ EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
     NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, shared_layout);
     NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
     NIR_PASS(_, nir, nir_opt_dce);
-    struct nak_shader_bin *bin = nak_compile_shader(nir, false, nak, 0, NULL, false);
+    bin = nak_compile_shader(nir, false, nak, 0, NULL, false);
     if (!bin) { fail(&state, "NAK compilation failed"); goto done; }
+    *constant_bytes = nir->constant_data_size;
+done:
+    if (nir) ralloc_free(nir);
+    nak_compiler_destroy(nak);
+    glsl_type_singleton_decref();
+    return bin;
+}
+
+EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
+                           const char *entry, uint32_t sm,
+                           struct nv_nak_result *out, char *error, size_t capacity)
+{
+    if ((capacity && !error) || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    struct nv_device_info dev;
+    if (nv_nak_device(sm, &dev)) {
+        if (capacity) snprintf(error, capacity, "Unsupported shader model %u", sm);
+        return -1;
+    }
+    uint32_t constant_bytes = 0;
+    struct nak_shader_bin *bin = nv_nak_build(words, count, entry, &dev, &constant_bytes, error, capacity);
+    if (!bin) return -1;
+    if (constant_bytes) {
+        if (capacity) snprintf(error, capacity, "Shader constant data (%u bytes) has no buffer in this ABI", constant_bytes);
+        nak_shader_bin_destroy(bin);
+        return -1;
+    }
     out->code = malloc(bin->code_size);
-    if (!out->code) { fail(&state, "Out of host memory"); nak_shader_bin_destroy(bin); goto done; }
+    if (!out->code) {
+        if (capacity) snprintf(error, capacity, "Out of host memory");
+        nak_shader_bin_destroy(bin);
+        return -1;
+    }
     memcpy(out->code, bin->code, bin->code_size);
     out->code_size = bin->code_size;
     out->registers = bin->info.num_gprs;
@@ -158,11 +219,7 @@ EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
     for (unsigned i = 0; i < 3; i++) out->workgroup[i] = bin->info.cs.local_size[i];
     out->cbuf_bytes = 1152;
     nak_shader_bin_destroy(bin);
-done:
-    if (nir) ralloc_free(nir);
-    nak_compiler_destroy(nak);
-    glsl_type_singleton_decref();
-    return state.failed ? -1 : 0;
+    return 0;
 }
 EXPORTED void nv_nak_free(struct nv_nak_result *result)
 {

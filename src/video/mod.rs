@@ -14,11 +14,13 @@
 pub mod av1;
 pub mod bits;
 pub mod channel;
+pub(crate) mod compute;
 pub mod ffi;
 pub mod enc;
 pub mod h264;
 pub mod hdr;
 pub mod hevc;
+pub(crate) mod kernels;
 pub mod legacy;
 pub mod mpeg2;
 pub mod mpeg4;

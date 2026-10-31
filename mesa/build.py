@@ -213,7 +213,7 @@ NVK_PATCH_LIST = [
     HERE / "nak-qmd-dependency.patch",
     HERE / "nvk-cs-join-qmd.patch",
     # A compute-only queue family whose queues run on their own
-    # subcontext in graphics queue 0's channel group (BLACKWELL_COMPUTE_B,
+    # subcontext in graphics queue 0's channel group (Volta and newer,
     # backends with shared contexts), as the proprietary driver exposes
     # and places its compute queues; its transfers and clears run as
     # compute work there.
@@ -223,9 +223,16 @@ NVK_PATCH_LIST = [
     # cache sequence with IGNORE_VEID, CWD slot count on GB20x); SKED
     # cache invalidates then happen only in that WFI-ALL form.
     HERE / "nvk-stock-compute-init.patch",
+    # Occupancy/launch-group fields and compute-class SCG initialisation.
+    HERE / "nak-qmd-launch-fields.patch",
+    HERE / "nvk-compute-scg-init.patch",
+    HERE / "nvk-compute-queue-cond-render.patch",
     # Hoist convergent loop invariants and sync only real continue edges.
     HERE / "nak-licm-convergent.patch",
     HERE / "nak-loop-continue-sync.patch",
+    # Shared SKED cache invalidation and compute classes without MME.
+    HERE / "nvk-turing-sked-qmd-invalidate.patch",
+    HERE / "nvk-compute-queue-no-mme.patch",
 ]
 
 def prepared_stamp(source, inputs):

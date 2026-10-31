@@ -128,7 +128,7 @@ pub unsafe extern "C" fn nv_c2_caps_destroy(caps: *mut NvC2Caps) {
         Ok(())
     });
 }
-unsafe fn text(gpu: *const c_char, out: *mut *mut NvC2Text, render: fn(&str) -> String) -> i32 {
+unsafe fn text(gpu: *const c_char, nvdec_class: u32, out: *mut *mut NvC2Text, render: fn(&str, u32) -> String) -> i32 {
     guard(|| {
         if out.is_null() {
             return Err(invalid("out"));
@@ -140,21 +140,22 @@ unsafe fn text(gpu: *const c_char, out: *mut *mut NvC2Text, render: fn(&str) -> 
         let gpu = unsafe { CStr::from_ptr(gpu) }
             .to_str()
             .map_err(|_| invalid("gpu_name UTF-8"))?;
-        let text = CString::new(render(gpu)).map_err(|_| invalid("text NUL"))?;
+        let text = CString::new(render(gpu, nvdec_class)).map_err(|_| invalid("text NUL"))?;
         unsafe { out.write(Box::into_raw(Box::new(NvC2Text(text)))) };
         Ok(())
     })
 }
 #[no_mangle]
-pub unsafe extern "C" fn nv_c2_no_decoder_xml(gpu: *const c_char, out: *mut *mut NvC2Text) -> i32 {
-    unsafe { text(gpu, out, no_decoder_xml) }
+pub unsafe extern "C" fn nv_c2_no_decoder_xml(gpu: *const c_char, nvdec_class: u32, out: *mut *mut NvC2Text) -> i32 {
+    unsafe { text(gpu, nvdec_class, out, no_decoder_xml) }
 }
 #[no_mangle]
 pub unsafe extern "C" fn nv_c2_no_decoder_reason(
     gpu: *const c_char,
+    nvdec_class: u32,
     out: *mut *mut NvC2Text,
 ) -> i32 {
-    unsafe { text(gpu, out, no_decoder_reason) }
+    unsafe { text(gpu, nvdec_class, out, no_decoder_reason) }
 }
 #[no_mangle]
 pub unsafe extern "C" fn nv_c2_text_view(text: *const NvC2Text, out: *mut NvC2Bytes) -> i32 {
@@ -212,7 +213,7 @@ mod tests {
         unsafe {
             let gpu = CString::new("a---b").unwrap();
             let mut t = ptr::null_mut();
-            assert_eq!(nv_c2_no_decoder_xml(gpu.as_ptr(), &mut t), 0);
+            assert_eq!(nv_c2_no_decoder_xml(gpu.as_ptr(), 0, &mut t), 0);
             drop(gpu);
             let mut a = NvC2Bytes::default();
             assert_eq!(nv_c2_text_view(t, &mut a), 0);

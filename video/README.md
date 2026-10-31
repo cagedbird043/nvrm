@@ -11,6 +11,18 @@ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fenc
 HDR metadata of every picture that carries any; `NV_VIDEO_MEASURE_ACQUIRE=1` (AVC test)
 re-passes the previous release fence as the acquire fence and times the copy_out call.
 
+## Codec2 能力快照 ABI
+
+`nv_c2_caps.h` 的 caps ABI 为 2，`nv_c2_no_decoder_xml` / `nv_c2_no_decoder_reason`
+接收 GPU 名称和 NVDEC class。class 为 0 时保留原有 XML 字节；非零 class 没有支持的
+codec 时，原因明确列出 class。成功查询但 decoder_count 为 0 是合法空快照，不打开 NVENC。
+查询错误、不可用尺寸或位深仍是错误，不能当作无硬解。xmlgen 对空能力生成/检查匹配的
+XML 均退出 3，XML 不匹配或能力错误退出 1；Codec2 服务使用相同文本接口。
+修改这个 ABI 后必须同时重编 RM、xmlgen 和 Codec2 服务。
+
+宿主 CLI 回归（先构建匹配 ABI 的 host cdylib 和 xmlgen）：
+`python3 nvidia-prolapse/media/test/test_nvc2_xmlgen.py`，可用 `NVC2_XMLGEN` 指定可执行文件。
+
 ## Codec2 解码驱动 ABI
 
 `nv_c2_dec.h` 的 `nv_c2_dec_*` 由 `src/video/{c2_dec,ffi_dec,c2_layout}.rs` 实现。

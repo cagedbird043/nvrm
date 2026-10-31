@@ -122,10 +122,7 @@ impl NvC2Caps {
                 caps: c,
             });
         }
-        if decoders.is_empty() {
-            return Err((-2, "GPU supports none of VP9/AV1/HEVC/H.264".into()));
-        }
-        let nvenc_class = nvenc()?;
+        let nvenc_class = if decoders.is_empty() { 0 } else { nvenc()? };
         let mut encoders = Vec::with_capacity(3);
         x.push_str("    </Decoders>\n    <Encoders>\n");
         if nvenc_class == 0xc9b7 {
@@ -153,7 +150,7 @@ impl NvC2Caps {
     }
     pub fn view(&self) -> NvC2CapsView {
         NvC2CapsView {
-            abi_version: 1,
+            abi_version: 2,
             nvenc_class: self.nvenc_class,
             decoders: if self.decoders.is_empty() {
                 ptr::null()
@@ -179,11 +176,15 @@ pub fn bytes(s: &CString) -> NvC2Bytes {
         len: s.as_bytes().len(),
     }
 }
-pub fn no_decoder_reason(gpu: &str) -> String {
-    format!("hardware video decode: not available on {gpu} (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used")
+pub fn no_decoder_reason(gpu: &str, nvdec_class: u32) -> String {
+    if nvdec_class == 0 {
+        format!("hardware video decode: not available on {gpu} (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used")
+    } else {
+        format!("hardware video decode: not available on {gpu} (NVDEC class 0x{nvdec_class:x}: no supported decode codecs): Android software decoders are used")
+    }
 }
-pub fn no_decoder_xml(gpu: &str) -> String {
-    let mut reason = no_decoder_reason(gpu);
+pub fn no_decoder_xml(gpu: &str, nvdec_class: u32) -> String {
+    let mut reason = no_decoder_reason(gpu, nvdec_class);
     while reason.contains("--") {
         reason = reason.replace("--", "-");
     }
@@ -263,16 +264,15 @@ mod tests {
     }
     #[test]
     fn errors_are_atomic() {
-        assert_eq!(
-            NvC2Caps::query(
-                |_| Ok(NvVideoCaps::default()),
-                || panic!("must not open encoder")
-            )
-            .err()
-            .unwrap()
-            .0,
-            -2
-        );
+        let empty = NvC2Caps::query(
+            |_| Ok(NvVideoCaps::default()),
+            || panic!("must not open encoder"),
+        ).unwrap();
+        let view = empty.view();
+        assert_eq!(view.decoder_count, 0);
+        assert_eq!(view.encoder_count, 0);
+        assert_eq!(view.nvenc_class, 0);
+        assert!(view.decoders.is_null() && view.encoders.is_null());
         assert!(NvC2Caps::query(
             |codec| {
                 let mut c = caps(codec)?;
@@ -303,11 +303,26 @@ mod tests {
     }
     #[test]
     fn no_decoder_contract() {
-        let reason = no_decoder_reason("stub");
+        let reason = no_decoder_reason("stub", 0);
         assert_eq!(reason,"hardware video decode: not available on stub (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used");
-        let xml = no_decoder_xml("a---b");
+        let xml = no_decoder_xml("a---b", 0);
         assert!(xml.contains("on a-b ("));
         assert!(!xml.contains("<MediaCodec "));
         assert!(xml.ends_with("</MediaCodecs>\n"));
+        let known = no_decoder_xml("a---b", 0xc3b0);
+        assert_ne!(known, xml);
+        assert!(known.contains("NVDEC class 0xc3b0: no supported decode codecs"));
+        assert!(!known.contains("<MediaCodec "));
+        for invalid in [0, 1, 2] {
+            assert!(NvC2Caps::query(|codec| {
+                let mut c = caps(codec)?;
+                match invalid {
+                    0 => c.max_width = 0,
+                    1 => c.min_height = c.max_height + 1,
+                    _ => c.bit_depth_mask = 0,
+                }
+                Ok(c)
+            }, || panic!("must not open encoder")).is_err());
+        }
     }
 }

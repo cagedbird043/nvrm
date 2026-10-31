@@ -3,7 +3,6 @@ use std::{
     ffi::{c_char, c_void, CStr, OsString},
     io::{self, Write},
     path::PathBuf,
-    ptr,
 };
 #[repr(C)]
 struct DeviceInfo {
@@ -40,8 +39,8 @@ unsafe extern "C" {
     fn nv_c2_caps_view(caps: *const c_void, out: *mut View) -> i32;
     fn nv_c2_media_codecs_xml(caps: *const c_void, out: *mut Bytes) -> i32;
     fn nv_c2_caps_destroy(caps: *mut c_void);
-    fn nv_c2_no_decoder_xml(gpu: *const c_char, out: *mut *mut c_void) -> i32;
-    fn nv_c2_no_decoder_reason(gpu: *const c_char, out: *mut *mut c_void) -> i32;
+    fn nv_c2_no_decoder_xml(gpu: *const c_char, nvdec_class: u32, out: *mut *mut c_void) -> i32;
+    fn nv_c2_no_decoder_reason(gpu: *const c_char, nvdec_class: u32, out: *mut *mut c_void) -> i32;
     fn nv_c2_text_view(text: *const c_void, out: *mut Bytes) -> i32;
     fn nv_c2_text_destroy(text: *mut c_void);
 }
@@ -130,10 +129,20 @@ fn generate(o: &Options) -> Result<i32, String> {
     }
     let gpu = unsafe { CStr::from_ptr(info.name.as_ptr().cast()) }.to_string_lossy();
     let mut xml = Bytes::default();
-    let status = if info.nvdec_class == 0 {
-        unsafe { nv_video_device_close(h.dev) };
-        h.dev = ptr::null_mut();
-        if unsafe { nv_c2_no_decoder_reason(info.name.as_ptr().cast(), &mut h.reason) } != 0 {
+    let mut view = View::default();
+    if info.nvdec_class != 0 {
+        if unsafe { nv_c2_caps_query(h.dev, &mut h.caps) } != 0 {
+            return Err(error());
+        }
+        if unsafe { nv_c2_caps_view(h.caps, &mut view) } != 0 {
+            return Err(error());
+        }
+        if view.abi_version != 2 {
+            return Err(format!("caps ABI {}, built for 2", view.abi_version));
+        }
+    }
+    let status = if view.decoder_count == 0 {
+        if unsafe { nv_c2_no_decoder_reason(info.name.as_ptr().cast(), info.nvdec_class, &mut h.reason) } != 0 {
             return Err(error());
         }
         let mut reason = Bytes::default();
@@ -144,7 +153,7 @@ fn generate(o: &Options) -> Result<i32, String> {
             "nvc2-xmlgen: {}",
             unsafe { CStr::from_ptr(reason.data) }.to_string_lossy()
         );
-        if unsafe { nv_c2_no_decoder_xml(info.name.as_ptr().cast(), &mut h.text) } != 0 {
+        if unsafe { nv_c2_no_decoder_xml(info.name.as_ptr().cast(), info.nvdec_class, &mut h.text) } != 0 {
             return Err(error());
         }
         if unsafe { nv_c2_text_view(h.text, &mut xml) } != 0 {
@@ -152,16 +161,6 @@ fn generate(o: &Options) -> Result<i32, String> {
         }
         3
     } else {
-        if unsafe { nv_c2_caps_query(h.dev, &mut h.caps) } != 0 {
-            return Err(error());
-        }
-        let mut view = View::default();
-        if unsafe { nv_c2_caps_view(h.caps, &mut view) } != 0 {
-            return Err(error());
-        }
-        if view.abi_version != 1 {
-            return Err(format!("caps ABI {}, built for 1", view.abi_version));
-        }
         if unsafe { nv_c2_media_codecs_xml(h.caps, &mut xml) } != 0 {
             return Err(error());
         }

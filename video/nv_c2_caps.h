@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NV_C2_CAPS_ABI_VERSION 1u
+#define NV_C2_CAPS_ABI_VERSION 2u
 #define NV_C2_XMLGEN_EXIT_NO_NVDEC 3
 /* Return codes, never errno. NV_VIDEO_* values retain their existing meaning. */
 #define NV_C2_OK                 0
@@ -53,8 +53,8 @@ struct NvC2Bytes {
 /* dev: valid device from nv_video_device_open with ABI 2 and nonzero NVDEC class.
  * Must remain open until snapshot destruction. out nonnull; *out NULL on failure.
  * Query all decoder caps and NVENC class once; validate and format XML once.
- * No partial snapshot on any failure. Zero advertised decoders -> UNSUPPORTED.
- * NVENC open failure -> mapped NV_VIDEO error, not an empty encoder table.
+ * No partial snapshot on any failure. Zero advertised decoders -> empty snapshot,
+ * without opening NVENC. Otherwise NVENC open failure -> mapped NV_VIDEO error.
  * Unsupported NVENC class -> success with encoder_count=0.
  */
 int32_t nv_c2_caps_query(struct NvVideoDevice *dev, struct NvC2Caps **out);
@@ -67,8 +67,8 @@ void nv_c2_caps_destroy(struct NvC2Caps *caps); /* NULL allowed */
  * Return an owned text handle; *out=NULL on failure. Reason excludes added period;
  * XML has existing exact bytes, including comment sanitization and final newline.
  */
-int32_t nv_c2_no_decoder_xml(const char *gpu_name, struct NvC2Text **out);
-int32_t nv_c2_no_decoder_reason(const char *gpu_name, struct NvC2Text **out);
+int32_t nv_c2_no_decoder_xml(const char *gpu_name, uint32_t nvdec_class, struct NvC2Text **out);
+int32_t nv_c2_no_decoder_reason(const char *gpu_name, uint32_t nvdec_class, struct NvC2Text **out);
 int32_t nv_c2_text_view(const struct NvC2Text *text, struct NvC2Bytes *out);
 void nv_c2_text_destroy(struct NvC2Text *text); /* NULL allowed */
 

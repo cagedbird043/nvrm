@@ -223,6 +223,9 @@ NVK_PATCH_LIST = [
     # cache sequence with IGNORE_VEID, CWD slot count on GB20x); SKED
     # cache invalidates then happen only in that WFI-ALL form.
     HERE / "nvk-stock-compute-init.patch",
+    # Hoist convergent loop invariants and sync only real continue edges.
+    HERE / "nak-licm-convergent.patch",
+    HERE / "nak-loop-continue-sync.patch",
 ]
 
 def prepared_stamp(source, inputs):

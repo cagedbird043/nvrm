@@ -138,17 +138,6 @@ endian = 'little'
 _GL_SUFFIX = os.environ.get("NVRM_GL_DIR_SUFFIX", "")
 GL_SOURCE = ROOT / f"build/mesa-gl-source{_GL_SUFFIX}"
 GL_RUST = ROOT / f"build/nvrm-rust{_GL_SUFFIX}"
-NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.patch",
-               "nvk-upstream-ecfea8d9-ycbcr-modifier.patch",
-               "nvk-upstream-bfb90f05-memory-plane-aspects.patch",
-               "nvk-explicit-plane-layouts.patch", "nvk-angle-nan-preserve-min-max.patch",
-               "mesa-disk-cache-create-with-path.patch", "mesa-disk-cache-keep-file-backend.patch",
-               "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch",
-               "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
-               "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch",
-               "nvk-pixel-shader-barrier.patch", "nak-qmd-cwd-membar.patch",
-               "nak-qmd-dependency.patch", "nvk-cs-join-qmd.patch",
-               "nvk-compute-queue-family.patch", "nvk-stock-compute-init.patch")
 
 GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
 # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
@@ -234,6 +223,8 @@ NVK_PATCH_LIST = [
     HERE / "nvk-turing-sked-qmd-invalidate.patch",
     HERE / "nvk-compute-queue-no-mme.patch",
 ]
+# NVK and GL consume exactly the same ordered stack.
+NVK_PATCHES = tuple(patch.name for patch in NVK_PATCH_LIST)
 
 def prepared_stamp(source, inputs):
     """Content hash of what a source preparation applies (patches, copied files): written into the worktree

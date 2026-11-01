@@ -41,8 +41,8 @@ pub struct Plane {
 }
 
 /// An external surface: NV12 (`bytes_per_sample` 1) or P010 (2) with a luma and an interleaved
-/// CbCr plane; with `chroma444`, 444P (1) or Q416 (2) with luma, Cb and Cr planes; or one BGRA
-/// plane (4). Unused planes are ignored.
+/// CbCr plane; with `chroma444`, 444P (1) or Q416 (2) with luma, Cb and Cr planes; or one packed
+/// RGB plane (4), whose byte order the conversion call supplies. Unused planes are ignored.
 #[derive(Clone, Copy, Debug)]
 pub struct Source {
     pub planes: [Plane; 3],
@@ -64,6 +64,32 @@ pub fn layout_from_modifier(modifier: u64) -> Option<Layout> {
     }
     let (h, g, c) = ((v & 0xf) as u32, (v >> 20) & 3, (v >> 23) & 7);
     (c == 0 && g == 2 && h <= 5).then_some(Layout::BlockLinear { log2_height: h })
+}
+
+/// Reject a plane whose pitch/offset cannot hold its complete linear or tiled extent.
+pub fn check_plane(layout: Layout, plane: &Plane, line: u32, rows: u32, size: u64) -> VResult<()> {
+    if line == 0 || rows == 0 || matches!(layout, Layout::BlockLinear { log2_height } if log2_height > 5) {
+        return Err(VideoError::Invalid("empty plane or invalid block-linear height".into()));
+    }
+    let need = match layout {
+        Layout::Linear => Some(u64::from(plane.pitch) * u64::from(rows - 1) + u64::from(line)),
+        Layout::BlockLinear { log2_height } => {
+            let block_rows = 8u64 << log2_height;
+            let padded_rows = (u64::from(rows) + block_rows - 1) & !(block_rows - 1);
+            u64::from(plane.pitch).checked_mul(padded_rows)
+        }
+    };
+    let valid = plane.pitch >= line && match layout {
+        Layout::Linear => plane.pitch % 4 == 0,
+        Layout::BlockLinear { .. } => plane.pitch % 64 == 0,
+    };
+    if !valid || need.and_then(|n| plane.offset.checked_add(n)).is_none_or(|end| end > size) {
+        return Err(VideoError::Invalid(format!(
+            "plane pitch {} offset {} cannot hold {rows} rows of {line} bytes in a {size}-byte dma-buf",
+            plane.pitch, plane.offset
+        )));
+    }
+    Ok(())
 }
 
 struct Import {
@@ -103,20 +129,21 @@ impl Ingest {
         })
     }
 
-    /// Converts a one-plane BGRA `source` (bytes B, G, R, A/X) into the tiled NV12 slot `dst` on
+    /// Converts a one-plane packed RGB `source` into the tiled NV12 slot `dst` on
     /// the GPU: the copy engine brings the visible region into a linear VRAM scratch, the
-    /// `bgra_nv12` kernel converts it there (bit-exact with the CPU conversion), and the copy
+    /// `bgra_nv12` kernel reads the specified byte order and converts it there, and the copy
     /// engine tiles luma and CbCr into the slot. No pixel crosses the CPU. Returns `Ok(false)`,
     /// having done nothing, when this GPU's compute kernels are not validated.
-    pub fn bgra_to_nv12(
+    pub fn rgb_to_nv12(
         &mut self,
         rm: &super::super::venc::NvVencDevice,
         key: u64,
         source: &Source,
         dst: &Destination,
+        order: crate::video::vpp::RgbOrder,
     ) -> VResult<bool> {
         let &Destination::Tiled { luma, chroma, pitch, width, height } = dst else {
-            return Err(VideoError::Invalid("BGRA conversion needs a tiled NVENC slot".into()));
+            return Err(VideoError::Invalid("RGB conversion needs a tiled NVENC slot".into()));
         };
         if self.compute.is_none() {
             self.compute = Some(match ComputeEngine::supported(&rm.device)? {
@@ -146,7 +173,7 @@ impl Ingest {
 
         let compute = self.compute.as_mut().unwrap().as_mut().unwrap();
         let kernel = compute.kernel("bgra_nv12")?;
-        let push: Vec<u8> = [width, height, src_pitch as u32, luma_pitch as u32, chroma_pitch as u32]
+        let push: Vec<u8> = [width, height, src_pitch as u32, luma_pitch as u32, chroma_pitch as u32, order.code()]
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
@@ -226,27 +253,6 @@ impl Ingest {
         Ok(index)
     }
 
-    /// Rejects a plane whose pitch or offset cannot hold `rows` rows of `line` bytes in `size`.
-    pub(crate) fn check_plane(layout: Layout, plane: &Plane, line: u32, rows: u32, size: u64) -> VResult<()> {
-        let need = match layout {
-            Layout::Linear => u64::from(plane.pitch) * u64::from(rows - 1) + u64::from(line),
-            Layout::BlockLinear { log2_height } => {
-                u64::from(plane.pitch) * u64::from(rows.next_multiple_of(8 << log2_height))
-            }
-        };
-        let valid = plane.pitch >= line
-            && match layout {
-                Layout::Linear => plane.pitch % 4 == 0,
-                Layout::BlockLinear { .. } => plane.pitch % 64 == 0,
-            };
-        if !valid || plane.offset.checked_add(need).is_none_or(|end| end > size) {
-            return Err(VideoError::Invalid(format!(
-                "plane pitch {} offset {} cannot hold {rows} rows of {line} bytes in a {size}-byte dma-buf",
-                plane.pitch, plane.offset
-            )));
-        }
-        Ok(())
-    }
 
     /// Appends the copy of one `rows` x `line`-byte rectangle of `plane` to `words`.
     fn rectangle(
@@ -259,7 +265,7 @@ impl Ingest {
         rows: u32,
         size: u64,
     ) -> VResult<()> {
-        Self::check_plane(layout, plane, line, rows, size)?;
+        check_plane(layout, plane, line, rows, size)?;
         let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
         match layout {
             Layout::Linear => launch |= 1 << 7, // source pitch
@@ -310,7 +316,7 @@ impl Ingest {
         bps: u32,
         component: u32,
     ) -> VResult<()> {
-        Self::check_plane(layout, plane, width * bps, rows, size)?;
+        check_plane(layout, plane, width * bps, rows, size)?;
         if dst_pitch < 2 * width * bps || dst_pitch % 64 != 0 {
             return Err(VideoError::Invalid(format!("interleaved chroma pitch {dst_pitch}")));
         }
@@ -440,6 +446,24 @@ impl Ingest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plane_extents_check_visible_and_tiled_storage() {
+        let mut plane = Plane { fd: -1, offset: 128, pitch: 256 };
+        assert!(check_plane(Layout::Linear, &plane, 252, 3, 892).is_ok());
+        assert!(check_plane(Layout::Linear, &plane, 252, 3, 891).is_err());
+        let tiled = Layout::BlockLinear { log2_height: 2 };
+        assert!(check_plane(tiled, &plane, 252, 33, 128 + 256 * 64).is_ok());
+        assert!(check_plane(tiled, &plane, 252, 33, 128 + 256 * 64 - 1).is_err());
+        assert!(check_plane(Layout::Linear, &plane, 257, 1, u64::MAX).is_err());
+        assert!(check_plane(Layout::Linear, &plane, 1, 0, u64::MAX).is_err());
+        assert!(check_plane(Layout::Linear, &plane, 0, 1, u64::MAX).is_err());
+        assert!(check_plane(Layout::BlockLinear { log2_height: 32 }, &plane, 1, 1, u64::MAX).is_err());
+        plane.offset = u64::MAX - 4;
+        assert!(check_plane(Layout::Linear, &plane, 8, 1, u64::MAX).is_err());
+        plane.offset = 0; plane.pitch = u32::MAX - 63;
+        assert!(check_plane(tiled, &plane, 64, u32::MAX, u64::MAX).is_ok());
+    }
 
     #[test]
     fn modifiers() {
@@ -627,14 +651,14 @@ mod tests {
         eprintln!("{cases} cases byte-exact");
     }
 
-    /// Stage-3 acceptance: the GPU BGRA conversion (`bgra_to_nv12`) writes the NVENC input slot
-    /// byte for byte as the CPU conversion of the encoder's fallback (`layout::in_tile_bgra`),
-    /// padding included. Patterns: per-channel extremes, solid colours, a chroma checkerboard and
+    /// GPU RGB-order conversion writes the NVENC slot byte for byte as the canonical BGRA
+    /// CPU reference (`layout::in_tile_bgra`), including padding. Every supported byte order
+    /// sees per-channel extremes, solid colours, a chroma checkerboard and
     /// a pseudo-random image whose X/A byte is garbage; sizes odd and even, crossing tile and
     /// GOB boundaries; linear sources with padded pitches and block-linear ones.
     #[test]
-    #[ignore = "local NVIDIA GPU: compute BGRA -> NV12 into a tiled NVENC input slot"]
-    fn bgra_to_nv12_matches_cpu() {
+    #[ignore = "local NVIDIA GPU: compute RGB -> NV12 into a tiled NVENC input slot"]
+    fn rgb_to_nv12_matches_cpu() {
         use crate::video::{enc::layout::in_tile_bgra, session::vram, venc::NvVencDevice};
         let rm = NvVencDevice::open_on(None).unwrap();
         let mut ingest = Ingest::new(&rm).unwrap();
@@ -667,6 +691,7 @@ mod tests {
                     let pitch = up(w, 64);
                     let luma_sz = pitch * up(h, 32);
                     let slot_sz = luma_sz + pitch * up(h.div_ceil(2), 16);
+                    for order in [crate::video::vpp::RgbOrder::Bgra, crate::video::vpp::RgbOrder::Rgba, crate::video::vpp::RgbOrder::Argb] {
                     for (name, pattern) in &patterns {
                         let mut image = vec![0u8; size];
                         let mut linear = vec![0u8; w * 4 * h];
@@ -674,7 +699,12 @@ mod tests {
                             for x in 0..w {
                                 let px = pattern(x, y, cases);
                                 linear[(y * w + x) * 4..][..4].copy_from_slice(&px);
-                                for (k, b) in px.iter().enumerate() {
+                                let encoded = match order {
+                                    crate::video::vpp::RgbOrder::Bgra => px,
+                                    crate::video::vpp::RgbOrder::Rgba => [px[2], px[1], px[0], px[3]],
+                                    crate::video::vpp::RgbOrder::Argb => [px[3], px[2], px[1], px[0]],
+                                };
+                                for (k, b) in encoded.iter().enumerate() {
                                     let o = match layout {
                                         Layout::Linear => y * src_pitch + x * 4 + k,
                                         Layout::BlockLinear { log2_height } => bl_offset(x * 4 + k, y, src_pitch, log2_height),
@@ -697,20 +727,21 @@ mod tests {
                             width: w as u32,
                             height: h as u32,
                         };
-                        assert!(ingest.bgra_to_nv12(&rm, cases as u64 + 1, &source, &dst).unwrap(), "compute not available");
+                        assert!(ingest.rgb_to_nv12(&rm, cases as u64 + 1, &source, &dst, order).unwrap(), "compute not available");
                         ingest.forget(cases as u64 + 1);
                         let got = get(&slot, slot_sz);
                         let mut want = vec![0u8; slot_sz];
                         let (l, c) = want.split_at_mut(luma_sz);
                         let mut scratch=vec![0; ((w+1)&!1).div_ceil(64)*64*48];
                         in_tile_bgra(l, c, &linear, w * 4, w, h, pitch, &mut scratch);
-                        let tag = format!("{name} {w}x{h} {layout:?} pitch {src_pitch}");
+                        let tag = format!("{name} {order:?} {w}x{h} {layout:?} pitch {src_pitch}");
                         assert_eq!(first_mismatch(&got, &want), None, "{tag}");
                         cases += 1;
+                    }
                     }
                 }
             }
         }
-        eprintln!("{cases} BGRA cases byte-exact with the CPU conversion");
+        eprintln!("{cases} RGB cases byte-exact with the CPU reference conversion");
     }
 }

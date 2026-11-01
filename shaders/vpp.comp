@@ -23,7 +23,7 @@ layout(set = 0, binding = 6, std430) readonly buffer Params {
     uint src_kind;  // 0: 4:2:0 (luma, CbCr), 1: 4:4:4 (luma, Cb, Cr), 2: packed RGB
     uint src_bps;   // bytes per sample (1, 2); 4 for RGB
     uint src_shift; // code = container >> shift
-    uint src_order; // RGB bytes: 0 = B, G, R, A; 1 = R, G, B, A
+    uint src_order; // RGB bytes: 0 = B,G,R,A; 1 = R,G,B,A; 2 = A,R,G,B
     uint dst_kind;
     uint dst_bps;
     uint dst_shift;
@@ -85,6 +85,8 @@ float yuv_tap(uint plane, uint pitch, uint elems, uint comp, int x, int y)
 vec3 rgb_tap(int x, int y)
 {
     uint w = s0[(uint(y) * p.src_pitch0 + uint(x) * 4u) >> 2];
+    if (p.src_order == 2u)
+        return vec3(float((w >> 8) & 255u), float((w >> 16) & 255u), float(w >> 24));
     vec3 c = vec3(float(w & 255u), float((w >> 8) & 255u), float((w >> 16) & 255u));
     return p.src_order == 0u ? c.zyx : c;
 }
@@ -195,7 +197,9 @@ void main()
             for (uint i = 0u; i < 4u; i++) {
                 uint first = p.dst_order == 0u ? c2[i] : c0[i];
                 uint third = p.dst_order == 0u ? c0[i] : c2[i];
-                d0[at + i] = first | c1[i] << 8u | third << 16u | a[i] << 24u;
+                d0[at + i] = p.dst_order == 2u
+                    ? a[i] | c0[i] << 8u | c1[i] << 16u | c2[i] << 24u
+                    : first | c1[i] << 8u | third << 16u | a[i] << 24u;
             }
         } else {
             store4(0u, p.dst_pitch0, x0, y, c0);

@@ -14,6 +14,7 @@ use std::{
     time::Instant,
 };
 use super::EncError;
+use super::packed::{PackedPicture, PackedSyntax};
 
 pub struct EncFrameView<'a> {
     pub frame: EncFrame,
@@ -173,6 +174,10 @@ pub struct Encoder {
     ingest: Option<ingest::Ingest>,
     stage: Mem,
     pub cfg: EncConfig,
+    packed_syntax: Option<PackedSyntax>,
+    packed_picture: Option<PackedPicture>,
+    frame_only: bool,
+    av1_external_poc: Option<u32>,
     rm: NvVencDevice,
     wmb: usize,
     hmb: usize,
@@ -209,6 +214,7 @@ pub struct Encoder {
     seq: u32,
     waited: u32,
     force_idr: bool,
+    cpb_capacity: [u32; 2],
     /// External input GPU VA in this encoder's address space (NVENC input layout).
     pub ext_input: u64,
     frame_num: u32,
@@ -261,6 +267,47 @@ fn mthd(w: &mut Vec<u32>, m: u32, v: u32) {
 fn addr(w: &mut Vec<u32>, m: u32, a: u64) {
     mthd(w, m, (a >> 8) as u32);
 }
+fn periodic_idr(disp: i32, client: bool, since_idr: u32, period: i32) -> bool {
+    !client && disp < 0 && period > 0 && since_idr >= period as u32
+}
+
+fn exchange_packed_syntax(current: &mut Option<PackedSyntax>, next: Option<PackedSyntax>,
+    cfg: &EncConfig, inflight: usize) -> VResult<Option<PackedSyntax>> {
+    if inflight != 0 { return Err(VideoError::Again("packed syntax change with pictures in flight".into())); }
+    if let Some(syntax) = &next { syntax.validate(cfg)?; }
+    Ok(std::mem::replace(current, next))
+}
+
+fn validate_idr_picture(picture: Option<PackedPicture>, idr: bool) -> Result<(), EncError> {
+    if idr && matches!(picture, Some(PackedPicture::H264 { frame_num, .. }) if frame_num != 0) {
+        return Err(EncError::InvalidUpdate { field: "H264 IDR frame_num must be zero" });
+    }
+    Ok(())
+}
+
+fn rescale_cpb_fullness(fullness: i32, previous: u32, next: u32) -> i32 {
+    if previous == next { return fullness; }
+    // Preserve the accumulated occupancy ratio when changing capacity. Starting
+    // without a budget uses the same half-full policy as session initialization.
+    let scaled = if previous == 0 { i64::from(next) * 8 }
+        else { i64::from(fullness) * i64::from(next) / i64::from(previous) };
+    scaled.clamp(0, (i64::from(next) * 16).min(i64::from(i32::MAX))) as i32
+}
+
+fn submit_with_cpb<T, E>(state: &mut nvenc_persistent_state_s, current: &mut [u32; 2],
+    next: [u32; 2], submit: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let before = [state.nal_cpb_fullness, state.vcl_cpb_fullness];
+    state.nal_cpb_fullness = rescale_cpb_fullness(before[0], current[0], next[0]);
+    state.vcl_cpb_fullness = rescale_cpb_fullness(before[1], current[1], next[1]);
+    match submit() {
+        Ok(result) => { *current = next; Ok(result) }
+        Err(error) => {
+            [state.nal_cpb_fullness, state.vcl_cpb_fullness] = before;
+            Err(error)
+        }
+    }
+}
+
 impl Encoder {
     pub fn open(cfg: &EncConfig) -> VResult<Self> {
         Self::open_on(cfg, None)
@@ -492,6 +539,11 @@ impl Encoder {
                 .map_err(|e|VideoError::NoMemory(e.to_string()))?;
         }
         Ok(Self {
+            packed_syntax: None,
+            packed_picture: None,
+            frame_only: false,
+            av1_external_poc: None,
+            cpb_capacity: [c.vbv_bits.max(0) as u32; 2],
             chan,
             ingest: None,
             stage: Mem::default(),
@@ -584,68 +636,13 @@ impl Encoder {
         drop(self);
     }
     fn h264_params(&self) -> h264hdr::H264Params {
-        let c = &self.cfg;
-        let cbp = !c.chroma444 && !c.lossless && c.h264_profile == 66;
-        h264hdr::H264Params {
-            width: c.width,
-            height: c.height,
-            colour: c.colour,
-            profile_idc: if c.chroma444 || c.lossless {
-                244
-            } else if c.h264_profile == 100 {
-                100
-            } else if cbp {
-                66
-            } else {
-                77
-            },
-            constraint_flags: if cbp { 0xc0 } else { 0 },
-            level_idc: if c.h264_level != 0 {
-                c.h264_level
-            } else if self.wmb * self.hmb > 36864 {
-                60
-            } else {
-                51
-            },
-            chroma444: c.chroma444,
-            lossless: c.lossless,
-            log2_max_frame_num_minus4: 4,
-            poc_type: if c.bframes > 0 { 0 } else { 2 },
-            log2_max_poc_lsb_minus4: 4,
-            num_reorder: i32::from(c.bframes > 0),
-            num_ref_frames: c.num_refs,
-            num_ref_idx_l0_minus1: c.num_refs - 1,
-            entropy_cabac: c.cabac,
-            transform_8x8: c.h264_profile == 100 || c.chroma444,
-            pic_init_qp: 26,
-            vui: true,
-            full_range: c.full_range,
-        }
+        h264hdr::config_params(&self.cfg)
     }
     fn hevc_params(&self) -> hevchdr::HevcParams {
-        let c = &self.cfg;
-        hevchdr::HevcParams {
-            width: c.width,
-            height: c.height,
-            log2_max_poc_lsb_minus4: 4,
-            max_dec_pic_buffering: c.num_refs + 1 + c.dpb_extra,
-            sps_rps_negative: c.num_refs,
-            num_reorder: i32::from(c.bframes > 0),
-            num_ref_idx_l0_default: c.num_refs,
-            pic_init_qp: 26,
-            vui: true,
-            full_range: c.full_range,
-            colour: c.colour,
-            min_cb8: c.quality && !c.no_cu8,
-            bit_depth: c.bit_depth,
-            chroma444: c.chroma444,
-            lossless: c.lossless,
-            no_sdh: true,
-            no_ts: c.bit_depth > 8,
-            ..Default::default()
-        }
+        hevchdr::config_params(&self.cfg)
     }
     fn av1_seq(&self) -> av1hdr::Av1SeqParams {
+        if let Some(s) = self.packed_syntax.as_ref().and_then(PackedSyntax::av1_params) { return s; }
         av1hdr::Av1SeqParams {
             width: self.cfg.width,
             height: self.cfg.height,
@@ -657,6 +654,35 @@ impl Encoder {
             ..Default::default()
         }
     }
+    /// Install validated client syntax only after the previous pictures have completed.
+    pub fn set_packed_syntax(&mut self, syntax: PackedSyntax) -> VResult<()> {
+        self.replace_packed_syntax(Some(syntax))?;
+        Ok(())
+    }
+    /// Move-exchange syntax at a drained boundary, including restoring generated mode.
+    /// Validation failure leaves the installed syntax unchanged.
+    pub fn replace_packed_syntax(&mut self, syntax: Option<PackedSyntax>) -> VResult<Option<PackedSyntax>> {
+        let inflight = self.inflight();
+        let previous = exchange_packed_syntax(&mut self.packed_syntax, syntax, &self.cfg, inflight)?;
+        self.packed_picture = None;
+        Ok(previous)
+    }
+    pub fn frame_only(&self) -> bool { self.frame_only }
+    /// Frame-only completion excludes generated HDR, temporal delimiters and parameter sets.
+    pub fn set_frame_only(&mut self, enabled: bool) -> VResult<()> {
+        if self.inflight() != 0 { return Err(VideoError::Again("output mode change with pictures in flight".into())); }
+        self.frame_only = enabled;
+        Ok(())
+    }
+    /// Supply the next picture's codec counters, without changing the C ABI.
+    pub fn set_packed_picture(&mut self, picture: PackedPicture) -> VResult<()> {
+        picture.validate(self.packed_syntax.as_ref(), &self.cfg)?;
+        if self.packed_picture.is_some() { return Err(invalid("packed picture already pending")); }
+        self.packed_picture = Some(picture);
+        Ok(())
+    }
+    /// Cancel and return the not-yet-submitted client picture without touching references.
+    pub fn take_packed_picture(&mut self) -> Option<PackedPicture> { self.packed_picture.take() }
     pub fn headers(&self, out: &mut Vec<u8>) {
         match self.cfg.codec {
             ENC_AV1 => {}
@@ -867,15 +893,16 @@ impl Encoder {
         let ingest = self.ingest.as_mut().unwrap();
         ingest.copy(&self.rm, key, src, &dst)
     }
-    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4). With
-    /// validated compute kernels the GPU converts it into the slot (see
-    /// [`ingest::Ingest::bgra_to_nv12`]); otherwise the copy engine brings the visible region into
-    /// a pitch-linear staging buffer and the CPU converts it with [`Encoder::load_bgra`]. Both
-    /// produce the same bytes.
+    /// BGRA convenience entry point retained for native and Codec2 consumers.
     pub fn load_dmabuf_bgra(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
+        self.load_dmabuf_rgb(key, src, crate::video::vpp::RgbOrder::Bgra)
+    }
+    /// Ingest packed RGB on the GPU, without CPU channel swaps. The established BGRA
+    /// path retains its CPU fallback on GPUs without validated compute kernels.
+    pub fn load_dmabuf_rgb(&mut self, key: u64, src: &ingest::Source, order: crate::video::vpp::RgbOrder) -> VResult<()> {
         let ds = self.input_slot()?;
         if src.bytes_per_sample != 4 || self.bps != 1 || self.cfg.chroma444 {
-            return Err(invalid("BGRA dma-buf needs an 8-bit 4:2:0 encoder"));
+            return Err(invalid("RGB dma-buf needs an 8-bit 4:2:0 encoder"));
         }
         self.aq_valid[ds] = false;
         if self.ingest.is_none() {
@@ -888,8 +915,11 @@ impl Encoder {
             width: self.cfg.width as u32,
             height: self.cfg.height as u32,
         };
-        if self.ingest.as_mut().unwrap().bgra_to_nv12(&self.rm, key, src, &tiled)? {
+        if self.ingest.as_mut().unwrap().rgb_to_nv12(&self.rm, key, src, &tiled, order)? {
             return Ok(());
+        }
+        if order != crate::video::vpp::RgbOrder::Bgra {
+            return Err(VideoError::Unsupported("RGB byte order requires validated GPU conversion".into()));
         }
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let pitch = up(w * 4, 64);
@@ -966,6 +996,7 @@ impl Encoder {
         let hp = self.h264_params();
         let c = &self.cfg;
         let magic = self.magic();
+        let poc_divisor = if matches!(&self.packed_syntax, Some(PackedSyntax::H264 { sps, .. }) if sps.pic_order_cnt_type == 0) { 1 } else { 2 };
         let nl0 = if b { nrefs - 1 } else { nrefs };
         let l0 = if b {
             &self.slot_of[1..]
@@ -1068,11 +1099,11 @@ impl Encoder {
         pc.l1 = [-2; 8];
         for i in 0..nl0 {
             pc.l0[i] = (2 * l0[i]) as i8;
-            pc.temp_dist_l0[i] = ((poc as i32 - self.slot_poc[l0[i]] as i32) / 2) as i8;
+            pc.temp_dist_l0[i] = ((poc.wrapping_sub(self.slot_poc[l0[i]]) as i32) / poc_divisor) as i8;
         }
         if b {
             pc.l1[0] = (2 * self.slot_of[0]) as i8;
-            pc.temp_dist_l1[0] = ((poc as i32 - self.slot_poc[self.slot_of[0]] as i32) / 2) as i8;
+            pc.temp_dist_l1[0] = ((poc.wrapping_sub(self.slot_poc[self.slot_of[0]]) as i32) / poc_divisor) as i8;
         }
         pc.dist_scale_factor = [[if b { -1 } else { 256 }; 8]; 8];
         if b {
@@ -1195,13 +1226,20 @@ impl Encoder {
         } else {
             s.copy(OFF_Q, &H264_TMPL_Q);
         }
+        if let Some(PackedSyntax::H264 { sps, pps }) = &self.packed_syntax {
+            super::packed::apply_h264(s.view_mut::<nvenc_h264_drv_pic_setup_s>(0), sps, pps, self.frame_num, poc);
+            s.view_mut::<nvenc_h264_md_control_s>(OFF_MD).set_intra_luma8x8_mode_enable(if pps.transform_8x8_mode { 0x1ff } else { 0 });
+        }
     }
 
     fn setup_hevc(&mut self, ds: usize, idr: bool, b: bool, nrefs: usize, poc: u32) {
         let hp = self.hevc_params();
         let magic = self.magic();
         let c = &self.cfg;
-        let (cw, ch) = (hevchdr::coded_width(&hp), hevchdr::coded_height(&hp));
+        let (cw, ch) = match &self.packed_syntax {
+            Some(PackedSyntax::Hevc { sps, .. }) => (sps.width as usize, sps.height as usize),
+            _ => (hevchdr::coded_width(&hp), hevchdr::coded_height(&hp)),
+        };
         let s = &mut self.setup[ds];
         s.bytes_mut().fill(0);
         let ps = s.view_mut::<nvenc_h265_drv_pic_setup_s>(0);
@@ -1231,7 +1269,7 @@ impl Encoder {
         let sp = &mut ps.sps_data;
         sp.set_chroma_format_idc(if c.chroma444 { 3 } else { 1 });
         sp.set_log2_max_pic_order_cnt_lsb_minus4(4);
-        sp.set_min_cu_size(if c.quality && !c.no_cu8 { 0 } else { 1 });
+        sp.set_min_cu_size(hevchdr::min_cb_log2(c) - 3);
         sp.set_max_cu_size(2);
         sp.set_min_tu_size(0);
         sp.set_max_tu_size(3);
@@ -1363,7 +1401,7 @@ impl Encoder {
                 ent[nl0] = self.slot_of[0];
             }
             for k in 0..ne {
-                td[k] = poc as i32 - (self.slot_poc[ent[k]] / 2) as i32;
+                td[k] = poc.wrapping_sub((self.slot_poc[ent[k]] as i32 / 2) as u32) as i32;
             }
             let rps = &mut pc.short_term_rps;
             rps.num_negative_pics = nl0 as i16;
@@ -1467,6 +1505,10 @@ impl Encoder {
             s.bytes_mut()[0x314] = 0x22;
             s.bytes_mut()[0x315] = 2;
         }
+        if let Some(PackedSyntax::Hevc { sps, pps }) = &self.packed_syntax {
+            super::packed::apply_hevc(s.view_mut::<nvenc_h265_drv_pic_setup_s>(0), sps, pps, poc, c);
+            super::packed::apply_hevc_slice(s.view_mut::<nvenc_h265_slice_control_s>(OFF_SLICE), sps, pps);
+        }
     }
 }
 
@@ -1492,6 +1534,7 @@ impl Encoder {
     ) {
         let area = self.rc_area();
         let c = &self.cfg;
+        let external_seq = self.packed_syntax.as_ref().and_then(PackedSyntax::av1_params);
         let rows = up(c.height as usize, 64);
         let b = self.setup[ds].bytes_mut();
         b[..AV1_TMPL_KEY.len()].copy_from_slice(if idr { &AV1_TMPL_KEY } else { &AV1_TMPL_P });
@@ -1536,6 +1579,7 @@ impl Encoder {
             b[0xa8..0xc0].copy_from_slice(&AV1_TMPL_HQ_FH[..0x18]);
             b[0xc4..0xc8].copy_from_slice(&AV1_TMPL_HQ_FH[0x1c..0x20]);
         }
+        if let Some(seq) = &external_seq { super::packed::apply_av1(b, seq); }
         if !idr {
             let nl0 = if is_b { nrefs - 1 } else { nrefs };
             let l0 = if is_b {
@@ -1812,17 +1856,35 @@ impl Encoder {
         self.submit_checked(force_idr,is_b,disp).map_err(Into::into)
     }
     pub(crate) fn submit_checked(&mut self,force_idr:bool,is_b:bool,disp:i32)->Result<u32,EncError> {
+        let before = (self.force_idr, self.frame_num, self.since_idr, self.nrefs, self.idr_disp,
+            self.av1_external_poc, self.av1_hid_disp, self.av1_last_shown);
+        let result = self.submit_inner(force_idr, is_b, disp);
+        if result.is_err() {
+            (self.force_idr, self.frame_num, self.since_idr, self.nrefs, self.idr_disp,
+                self.av1_external_poc, self.av1_hid_disp, self.av1_last_shown) = before;
+            self.packed_picture = None;
+        }
+        result
+    }
+    fn submit_inner(&mut self,force_idr:bool,is_b:bool,disp:i32)->Result<u32,EncError> {
         let ds = if self.inflight() >= self.cfg.depth as usize {
             return Err(EncError::InputSlotsBusy);
         } else {self.seq as usize % self.cfg.depth as usize};
+        if let Some(syntax) = &self.packed_syntax {
+            syntax.validate(&self.cfg).map_err(|_| EncError::InvalidUpdate { field: "packed syntax/config" })?;
+            let picture = self.packed_picture.ok_or(EncError::InvalidUpdate { field: "missing packed picture" })?;
+            picture.validate(Some(syntax), &self.cfg).map_err(|_| EncError::InvalidUpdate { field: "packed picture" })?;
+            if is_b && (self.cfg.bframes == 0 || self.nrefs < 2) {
+                return Err(EncError::InvalidUpdate { field: "packed B reference model" });
+            }
+        }
         let b = is_b && self.cfg.bframes > 0 && self.nrefs >= 2;
         let idr = !b
             && (force_idr
                 || self.force_idr
                 || self.seq == 0
-                || (disp < 0
-                    && self.cfg.idr_period > 0
-                    && self.since_idr >= self.cfg.idr_period as u32));
+                || periodic_idr(disp, self.packed_syntax.is_some(), self.since_idr, self.cfg.idr_period));
+        validate_idr_picture(self.packed_picture, idr)?;
         self.force_idr = false;
         if idr {
             self.frame_num = 0;
@@ -1834,11 +1896,30 @@ impl Encoder {
         }
         let slot = if b { self.b_slot } else { self.next_slot };
         let nrefs = if idr { 0 } else { self.nrefs };
-        let poc = if disp >= 0 {
-            2u32.wrapping_mul((disp - self.idr_disp) as u32)
-        } else {
-            2 * self.since_idr
+        let picture = self.packed_picture.take();
+        if let Some(PackedPicture::H264 { frame_num, .. }) = picture { self.frame_num = frame_num; }
+        let poc = match picture {
+            Some(PackedPicture::H264 { poc, .. }) => poc as u32,
+            Some(PackedPicture::Hevc { poc }) => (poc as u32).wrapping_mul(2),
+            Some(PackedPicture::Av1 { order_hint }) => {
+                let bits = self.av1_seq().order_hint_bits;
+                let last = if idr { None } else { self.av1_external_poc };
+                let unwrapped = super::packed::unwrap_picture_hint(last, order_hint, bits as u32, self.cfg.bframes == 0);
+                unwrapped.wrapping_mul(2)
+            }
+            None if disp >= 0 => 2u32.wrapping_mul((disp - self.idr_disp) as u32),
+            None => 2 * self.since_idr,
         };
+        if let Some(syntax) = &self.packed_syntax {
+            let divisor = if matches!(syntax, PackedSyntax::H264 { sps, .. } if sps.pic_order_cnt_type == 0) { 1 } else { 2 };
+            for &reference in &self.slot_of[..nrefs] {
+                let distance = (poc.wrapping_sub(self.slot_poc[reference]) as i32) / divisor;
+                if distance == 0 || !(-127..=127).contains(&distance) {
+                    return Err(EncError::InvalidUpdate { field: "packed temporal reference distance" });
+                }
+            }
+        }
+        if matches!(picture, Some(PackedPicture::Av1 { .. })) { self.av1_external_poc = Some(poc / 2); }
         let hevc = self.cfg.codec == ENC_HEVC;
         let av1 = self.cfg.codec == ENC_AV1;
         if av1 {
@@ -2034,10 +2115,25 @@ impl Encoder {
         let mut ref_oh = [0; 4];
         for i in 0..nrefs {
             refs[i] = self.slot_of[i];
-            ref_oh[i] = (self.slot_poc[self.slot_of[i]] / 2) as i32;
+            ref_oh[i] = self.slot_poc[self.slot_of[i]] as i32 / 2;
         }
         let t0 = Instant::now();
-        let timeline = self.chan.submit_enc(words)?;
+        let capacity = if !av1 && self.cfg.rc_mode != 0 {
+            if hevc {
+                let r = &self.setup[ds].view_mut::<nvenc_h265_drv_pic_setup_s>(0).rate_control;
+                Some([r.nal_cpb_size as u32, r.vcl_cpb_size as u32])
+            } else {
+                let r = &self.setup[ds].view_mut::<nvenc_h264_drv_pic_setup_s>(0).rate_control;
+                Some([r.nal_cpb_size as u32, r.vcl_cpb_size as u32])
+            }
+        } else { None };
+        let timeline = if let Some(next) = capacity.filter(|next| *next != self.cpb_capacity) {
+            // rcproc is shared by all frames; only a drained boundary permits a
+            // CPU update. Ordinary PPS changes leave all RC history untouched.
+            if self.inflight() != 0 { return Err(EncError::InvalidUpdate { field: "CPB capacity change with pictures in flight" }); }
+            submit_with_cpb(self.rcproc.view_mut::<nvenc_persistent_state_s>(0),
+                &mut self.cpb_capacity, next, || self.chan.submit_enc(words))?
+        } else { self.chan.submit_enc(words)? };
         self.seq = payload;
         self.pend[ds] = Pending {
             idr,
@@ -2068,7 +2164,11 @@ impl Encoder {
                     break;
                 }
             }
-            self.frame_num = (self.frame_num + 1) % 256;
+            let bits = match &self.packed_syntax {
+                Some(PackedSyntax::H264 { sps, .. }) => sps.log2_max_frame_num_minus4 + 4,
+                _ => 8,
+            };
+            self.frame_num = (self.frame_num + 1) & ((1 << bits) - 1);
             self.since_idr += 1;
         }
         Ok(payload)
@@ -2143,7 +2243,8 @@ impl Encoder {
         if size >= capacity || off.checked_add(size).is_none_or(|end| end > capacity) {
             return Err(EncError::BitstreamRange { offset: off, bytes: size, capacity });
         }
-        let assembled = self.cfg.codec == ENC_AV1 || (p.idr && (self.cfg.has_mdcv || self.cfg.has_cll));
+        let hevc_qp = matches!(&self.packed_syntax, Some(PackedSyntax::Hevc { pps, .. }) if pps.init_qp_minus26 != 0);
+        let assembled = self.cfg.codec == ENC_AV1 || hevc_qp || (!self.frame_only && p.idr && (self.cfg.has_mdcv || self.cfg.has_cll));
         if !assembled {
             frame.size = size;
             return Ok((frame, ds, off, size, false));
@@ -2157,7 +2258,7 @@ impl Encoder {
                 return Err(e);
             }
         } else {
-            if p.idr {
+            if p.idr && !self.frame_only {
                 h264hdr::write_hdr_sei(
                     self.cfg.codec == ENC_HEVC,
                     if self.cfg.has_mdcv {
@@ -2173,7 +2274,14 @@ impl Encoder {
                     &mut out,
                 );
             }
-            out.extend_from_slice(&self.bs[ds].bytes()[off..off + size]);
+            let data = &self.bs[ds].bytes()[off..off + size];
+            if hevc_qp {
+                let Some(PackedSyntax::Hevc { sps, pps }) = &self.packed_syntax else { unreachable!() };
+                if let Err(source) = super::hevcslice::rewrite(data, sps, pps, &mut out) {
+                    self.assembled = out;
+                    return Err(EncError::BitstreamAssembly { source });
+                }
+            } else { out.extend_from_slice(data); }
         }
         frame.size = out.len();
         let length = out.len();
@@ -2279,8 +2387,8 @@ impl Encoder {
             frame.hidden = true;
             return Ok(());
         }
-        av1hdr::write_temporal_delimiter(out);
-        if key {
+        if !self.frame_only { av1hdr::write_temporal_delimiter(out); }
+        if key && !self.frame_only {
             av1hdr::write_sequence_header(&seq, out);
             av1hdr::write_hdr_metadata(
                 if self.cfg.has_mdcv {
@@ -2368,5 +2476,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn periodic_idr_preserves_native_schedule_but_not_client_syntax() {
+        assert!(!periodic_idr(-1, false, 59, 60));
+        assert!(periodic_idr(-1, false, 60, 60));
+        assert!(!periodic_idr(-1, false, 60, 0));
+        assert!(!periodic_idr(60, false, 60, 60));
+        assert!(!periodic_idr(-1, true, 60, 60));
+        assert!(!periodic_idr(-1, true, 120, 60));
+    }
+
+    #[test]
+    fn syntax_exchange_moves_ownership_and_rejects_before_mutation() {
+        let cfg = EncConfig { codec: ENC_H264, width: 640, height: 360, bit_depth: 8,
+            h264_profile: 100, num_refs: 1, rc_mode: 2, ..Default::default() };
+        let super::super::packed::PackedDefaults::H264 { mut sps, pps } =
+            super::super::packed::PackedDefaults::for_config(&cfg, 31).unwrap() else { panic!() };
+        sps.vui.nal_hrd = Some(crate::video::h264::ps::Hrd { cpb: vec![(1_000_000, 2_000_000, true)],
+            initial_cpb_removal_delay_length: 24, cpb_removal_delay_length: 16,
+            dpb_output_delay_length: 8, time_offset_length: 0 });
+        let allocation = sps.vui.nal_hrd.as_ref().unwrap().cpb.as_ptr();
+        let mut current = Some(PackedSyntax::H264 { sps, pps });
+        assert!(exchange_packed_syntax(&mut current, None, &cfg, 1).is_err());
+        let invalid = PackedSyntax::Av1 { sequence: Default::default() };
+        assert!(exchange_packed_syntax(&mut current, Some(invalid), &cfg, 0).is_err());
+        let previous = exchange_packed_syntax(&mut current, None, &cfg, 0).unwrap();
+        assert!(current.is_none());
+        let Some(PackedSyntax::H264 { sps, pps }) = &previous else { panic!() };
+        assert_eq!(sps.vui.nal_hrd.as_ref().unwrap().cpb.as_ptr(), allocation);
+        assert_eq!(pps.pic_init_qp_minus26, 5);
+        assert!(exchange_packed_syntax(&mut current, previous, &cfg, 0).unwrap().is_none());
+        assert!(matches!(current, Some(PackedSyntax::H264 { .. })));
+    }
+
+    #[test]
+    fn external_idr_checks_the_actual_picture_decision() {
+        let invalid = Some(PackedPicture::H264 { frame_num: 1, poc: 2 });
+        assert!(validate_idr_picture(invalid, false).is_ok());
+        assert!(matches!(validate_idr_picture(invalid, true), Err(EncError::InvalidUpdate { .. })));
+        assert!(validate_idr_picture(Some(PackedPicture::H264 { frame_num: 0, poc: 2 }), true).is_ok());
+        assert!(validate_idr_picture(Some(PackedPicture::Hevc { poc: 2 }), true).is_ok());
+        assert!(validate_idr_picture(None, true).is_ok());
+    }
+
+    #[test]
+    fn cpb_budget_changes_preserve_history_and_roll_back_failed_submission() {
+        let mut state = nvenc_persistent_state_s { nal_cpb_fullness: 2_000_000 * 16,
+            vcl_cpb_fullness: 1_000_000 * 16, Whist: [[17; 3]; 3], Wpbi: [19; 3],
+            np: 1234, Bavg: 5678, prevQP: 31, ..Default::default() };
+        let mut capacity = [4_000_000; 2];
+        let client = [1_000_000, 2_000_000];
+        submit_with_cpb(&mut state, &mut capacity, client, || Ok::<_, ()>(())).unwrap();
+        assert_eq!([state.nal_cpb_fullness, state.vcl_cpb_fullness], [500_000 * 16; 2]);
+        // Model the next completed frame: another PPS carrying the same HRD must
+        // keep these accumulated values, not reinitialize both CPBs to half full.
+        state.nal_cpb_fullness += 143; state.vcl_cpb_fullness -= 97;
+        let accumulated = [state.nal_cpb_fullness, state.vcl_cpb_fullness];
+        submit_with_cpb(&mut state, &mut capacity, client, || Ok::<_, ()>(())).unwrap();
+        assert_eq!([state.nal_cpb_fullness, state.vcl_cpb_fullness], accumulated);
+        assert!(submit_with_cpb(&mut state, &mut capacity, [3_000_000, 1_000_000], || Err::<(), _>(())).is_err());
+        assert_eq!(capacity, client);
+        assert_eq!([state.nal_cpb_fullness, state.vcl_cpb_fullness], accumulated);
+        // Restoring generated mode changes only capacities/fullness, never DPB or
+        // the learned rate/complexity model.
+        submit_with_cpb(&mut state, &mut capacity, [4_000_000; 2], || Ok::<_, ()>(())).unwrap();
+        assert_eq!(state.nal_cpb_fullness, accumulated[0] * 4);
+        assert_eq!(state.vcl_cpb_fullness, accumulated[1] * 2);
+        assert_eq!(state.Whist, [[17; 3]; 3]); assert_eq!(state.Wpbi, [19; 3]);
+        assert_eq!((state.np, state.Bavg, state.prevQP), (1234, 5678, 31));
+        assert_eq!(rescale_cpb_fullness(0, 0, 1_000_000), 500_000 * 16);
+        assert_eq!(rescale_cpb_fullness(i32::MAX, 1, 1_000_000), 1_000_000 * 16);
     }
 }

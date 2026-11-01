@@ -63,6 +63,8 @@ pub struct SequenceHeader {
     pub subsampling_x: bool,
     pub subsampling_y: bool,
     pub color_range: bool,
+    pub color_description: [u32; 3],
+    pub chroma_sample_position: u32,
     pub separate_uv_delta_q: bool,
     pub film_grain_params_present: bool,
 }
@@ -85,6 +87,12 @@ impl SequenceHeader {
     }
 
     pub fn parse(data: &[u8]) -> Result<Self> {
+        Self::parse_inner(data, false)
+    }
+    pub(crate) fn parse_for_encode(data: &[u8]) -> Result<Self> {
+        Self::parse_inner(data, true)
+    }
+    fn parse_inner(data: &[u8], encode: bool) -> Result<Self> {
         let mut r = BitReader::new(data);
         let mut s = SequenceHeader {
             seq_profile: r.f(3)? as u8,
@@ -209,6 +217,7 @@ impl SequenceHeader {
             tc = r.f(8)?;
             mc = r.f(8)?;
         }
+        s.color_description = [cp, tc, mc];
         if s.mono_chrome {
             s.color_range = r.flag()?;
             s.subsampling_x = true;
@@ -235,13 +244,19 @@ impl SequenceHeader {
                 }
             }
             if s.subsampling_x && s.subsampling_y {
-                r.f(2)?; // chroma_sample_position
+                s.chroma_sample_position = r.f(2)?;
             }
         }
         if !s.mono_chrome {
             s.separate_uv_delta_q = r.flag()?;
         }
         s.film_grain_params_present = r.flag()?;
+        if encode {
+            if !r.flag()? { return Err(Av1Error::Invalid("sequence trailing_one_bit")); }
+            while r.bit_pos() < data.len() * 8 {
+                if r.flag()? { return Err(Av1Error::Invalid("sequence trailing_zero_bit")); }
+            }
+        }
         Ok(s)
     }
 }

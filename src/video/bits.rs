@@ -141,6 +141,27 @@ impl<'a> BitReader<'a> {
         }
         matches!(last, Some(l) if self.pos < l)
     }
+    /// Consume rbsp_trailing_bits, optionally leaving a following Annex-B NAL unread.
+    pub(crate) fn finish_rbsp(&mut self, prefix: bool) -> VResult<usize> {
+        if !self.flag()? { return bitstream("parameter rbsp_stop_one_bit"); }
+        while self.pos % 8 != 0 { if self.flag()? { return bitstream("parameter rbsp_alignment_zero_bit"); } }
+        let bytes = self.pos / 8;
+        if !prefix { while self.bits_left() > 0 { if self.flag()? { return bitstream("parameter trailing bytes"); } } }
+        Ok(bytes)
+    }
+    /// PPS optional extension detection after its mandatory syntax. A stop bit plus
+    /// byte padding followed by a delimiter belongs to this PPS, not the next NAL.
+    pub(crate) fn more_rbsp_data_in_prefix(&self) -> bool {
+        let shift = self.pos % 8;
+        let Some(&byte) = self.data.get(self.pos / 8) else { return false };
+        let mask = (1u16 << (8 - shift)) - 1;
+        if u16::from(byte) & mask != 1 << (7 - shift) { return true; }
+        let rest = &self.data[self.pos / 8 + 1..];
+        match rest.iter().position(|&b| b != 0) {
+            None => false,
+            Some(i) => !(i >= 2 && rest[i] == 1),
+        }
+    }
 }
 
 /// Splits an Annex-B elementary stream into access units (H.264 7.4.1.2.3 / H.265 7.4.2.4.4):

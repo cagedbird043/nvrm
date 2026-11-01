@@ -154,7 +154,11 @@ impl Cpu {
         match self.pixels {
             Pixels::Rgb(order) => {
                 let (b0, b1, b2, a) = (self.get(0, x, 0, y), self.get(0, x, 1, y), self.get(0, x, 2, y), self.get(0, x, 3, y));
-                if order == RgbOrder::Bgra { [b2, b1, b0, a] } else { [b0, b1, b2, a] }
+                match order {
+                    RgbOrder::Bgra => [b2, b1, b0, a],
+                    RgbOrder::Rgba => [b0, b1, b2, a],
+                    RgbOrder::Argb => [b1, b2, a, b0],
+                }
             }
             Pixels::Yuv420 { .. } => [self.get(0, x, 0, y), self.get(1, x / 2, 0, y / 2), self.get(1, x / 2, 1, y / 2), 0],
             Pixels::Yuv444 { .. } => [self.get(0, x, 0, y), self.get(1, x, 0, y), self.get(2, x, 0, y), 0],
@@ -220,7 +224,7 @@ fn open() -> (VideoDevice, Processor) {
     (dev, vpp)
 }
 
-const FORMATS: [Pixels; 8] = [
+const FORMATS: [Pixels; 9] = [
     Pixels::Yuv420 { bits: 8 },
     Pixels::Yuv420 { bits: 10 },
     Pixels::Yuv420 { bits: 12 },
@@ -229,6 +233,7 @@ const FORMATS: [Pixels; 8] = [
     Pixels::Yuv444 { bits: 10 },
     Pixels::Rgb(RgbOrder::Bgra),
     Pixels::Rgb(RgbOrder::Rgba),
+    Pixels::Rgb(RgbOrder::Argb),
 ];
 
 fn whole(w: u32, h: u32) -> Rect {
@@ -420,6 +425,7 @@ fn kernel_matches_reference() {
     let q416 = Pixels::Yuv444 { bits: 10 };
     let bgra = Pixels::Rgb(RgbOrder::Bgra);
     let rgba = Pixels::Rgb(RgbOrder::Rgba);
+    let argb = Pixels::Rgb(RgbOrder::Argb);
     let rgb = |full| colour(Matrix::Rgb, full);
     let mut cases: Vec<(Pixels, Colour, Pixels, Colour)> = Vec::new();
     for m in [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020] {
@@ -427,6 +433,8 @@ fn kernel_matches_reference() {
             cases.push((nv12, colour(m, full), bgra, rgb(true)));
             cases.push((bgra, rgb(true), nv12, colour(m, full)));
             cases.push((p010, colour(m, full), rgba, rgb(true)));
+            cases.push((p010, colour(m, full), argb, rgb(true)));
+            cases.push((argb, rgb(true), nv12, colour(m, full)));
             cases.push((nv12, colour(m, full), nv12, colour(Matrix::Bt709, !full)));
         }
     }
@@ -437,6 +445,8 @@ fn kernel_matches_reference() {
     cases.push((Pixels::Yuv420 { bits: 8 }, Colour { chroma_site: CENTRE, ..colour(Matrix::Bt709, false) }, y444, colour(Matrix::Bt709, false)));
     cases.push((q416, colour(Matrix::Bt601, false), bgra, rgb(false)));
     cases.push((rgba, rgb(false), bgra, rgb(true)));
+    cases.push((rgba, rgb(false), argb, rgb(true)));
+    cases.push((argb, rgb(false), bgra, rgb(true)));
     cases.push((nv12, colour(Matrix::Bt709, false), nv12, colour(Matrix::Bt709, false)));
 
     let geometry = [

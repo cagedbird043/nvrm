@@ -24,6 +24,7 @@ pub enum EncError {
     Av1EmptyTile { tile: usize },
     Av1TileRange { tile: usize, offset: usize, bytes: usize, capacity: usize },
     OutputAssemblyCapacity,
+    BitstreamAssembly { source: VideoError },
     InternalInvariant { reason: &'static str },
     Panic,
 }
@@ -33,7 +34,7 @@ impl EncError {
             | Self::InvalidUpdate { .. } | Self::FrameMicrocode { .. }
             | Self::EmptyBitstream { .. } | Self::BitstreamRange { .. }
             | Self::Av1TileCount { .. } | Self::Av1EmptyTile { .. }
-            | Self::Av1TileRange { .. } | Self::OutputAssemblyCapacity)
+            | Self::Av1TileRange { .. } | Self::OutputAssemblyCapacity | Self::BitstreamAssembly { .. })
     }
 }
 impl std::fmt::Display for EncError {

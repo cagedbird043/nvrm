@@ -230,6 +230,37 @@ pub fn diag_scan(blk: usize) -> Vec<(usize, usize)> {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderTiming {
+    pub num_units_in_tick: u32,
+    pub time_scale: u32,
+    pub poc_ticks: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderHrd {
+    /// Effective (bitrate, CPB size, cbr_flag), after applying the signalled scales.
+    pub nal: Vec<(u64, u64, bool)>,
+    pub vcl: Vec<(u64, u64, bool)>,
+    pub initial_cpb_removal_delay_length: u32,
+    pub au_cpb_removal_delay_length: u32,
+    pub dpb_output_delay_length: u32,
+    pub fixed_duration: Option<u64>,
+    pub low_delay: bool,
+}
+#[derive(Debug, Clone, Default)]
+pub struct EncoderSequence {
+    pub timing: Option<EncoderTiming>,
+    pub hrd: Option<EncoderHrd>,
+    pub vps_timing: Option<EncoderTiming>,
+    pub full_range: bool,
+    pub colour: Option<[u8; 3]>,
+    pub level_idc: Option<u8>,
+    pub tier: bool,
+    pub aspect_ratio_idc: Option<u8>,
+    pub sar: [u16; 2],
+    pub vps_hrd: Option<EncoderHrd>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Sps {
     pub id: u32,
@@ -269,6 +300,7 @@ pub struct Sps {
     pub strong_intra_smoothing: bool,
     /// sps_range_extension (all false/0 for Main and Main 10).
     pub rext: SpsRext,
+    pub encoder: EncoderSequence,
 }
 /// Range-extension flags of the SPS the engine descriptor carries (nvdec_hevc_main10_444_ext_s).
 /// The Annex-B parser here rejects the extension; parameter-driven callers (VA-API) fill it.
@@ -297,12 +329,13 @@ impl Sps {
     }
 }
 
-fn profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> VResult<u32> {
-    r.skip(2 + 1)?; // general_profile_space, general_tier_flag
+fn profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> VResult<(u32, u8, bool)> {
+    r.skip(2)?;
+    let tier = r.flag()?;
     let profile_idc = r.u(5)?;
     let compat = r.u(32)?;
     r.skip(4 + 43 + 1)?; // progressive/interlaced/non_packed/frame_only, 43 reserved/constraint bits, inbld
-    r.skip(8)?; // general_level_idc
+    let level = r.u(8)? as u8;
     let mut prof = [false; 8];
     let mut lvl = [false; 8];
     for i in 0..max_sub_layers_minus1 as usize {
@@ -328,10 +361,23 @@ fn profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> VResult<
     } else {
         profile_idc
     };
-    Ok(p)
+    Ok((p, level, tier))
 }
 
 pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
+    parse_sps_inner(rbsp, false, None)
+}
+
+/// Encoder contract: parse VUI as well, and reject extensions rather than dropping tools.
+pub fn parse_sps_for_encode(rbsp: &[u8]) -> VResult<Sps> {
+    parse_sps_inner(rbsp, true, None)
+}
+
+pub(crate) fn unescaped_sps_len(rbsp: &[u8]) -> VResult<usize> {
+    let mut bytes = 0; parse_sps_inner(rbsp, true, Some(&mut bytes))?; Ok(bytes)
+}
+fn parse_sps_inner(rbsp: &[u8], encode: bool, consumed: Option<&mut usize>) -> VResult<Sps> {
+    if rbsp.len() < 3 { return bitstream("truncated HEVC SPS"); }
     let mut r = BitReader::new(&rbsp[2..]);
     let r = &mut r;
     r.skip(4)?; // sps_video_parameter_set_id
@@ -339,14 +385,11 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
     if max_sub_layers_minus1 > 6 {
         return bitstream("sps_max_sub_layers_minus1 > 6");
     }
+    if encode && max_sub_layers_minus1 != 0 { return unsupported("HEVC encoder temporal sublayers"); }
     r.skip(1)?;
-    let profile_idc = profile_tier_level(r, max_sub_layers_minus1)?;
-    // Main (1), Main 10 (2), Main Still Picture (3): VUI and SPS extensions carry nothing the
-    // engine descriptor needs for these profiles, so parsing stops after the coding tools.
-    if !(1..=3).contains(&profile_idc) {
-        return unsupported(format!(
-            "HEVC profile_idc {profile_idc} (only Main, Main 10, Main Still Picture)"
-        ));
+    let (profile_idc, level_idc, tier) = profile_tier_level(r, max_sub_layers_minus1)?;
+    if !(1..=3).contains(&profile_idc) && !(encode && profile_idc == 4) {
+        return unsupported(format!("HEVC profile_idc {profile_idc}"));
     }
     let id = r.ue_max(15, "sps_seq_parameter_set_id")?;
     let chroma_format_idc = r.ue_max(3, "chroma_format_idc")?;
@@ -355,10 +398,8 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
     } else {
         false
     };
-    if chroma_format_idc != 1 {
-        return unsupported(format!(
-            "HEVC chroma_format_idc {chroma_format_idc} (only 4:2:0)"
-        ));
+    if chroma_format_idc != 1 && !(encode && profile_idc == 4 && chroma_format_idc == 3) {
+        return unsupported(format!("HEVC chroma_format_idc {chroma_format_idc}"));
     }
     let width = r.ue_max(16888, "pic_width_in_luma_samples")?;
     let height = r.ue_max(16888, "pic_height_in_luma_samples")?;
@@ -439,7 +480,28 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
     }
     let temporal_mvp = r.flag()?;
     let strong_intra_smoothing = r.flag()?;
-    // vui_parameters_present_flag and the rest: not needed (see profile gate above).
+    let mut encoder = EncoderSequence::default();
+    let mut rext = SpsRext::default();
+    if encode {
+        if r.flag()? { encoder = encoder_vui(r, max_sub_layers_minus1)?; }
+        if r.flag()? {
+            let range = r.flag()?;
+            if r.u(7)? != 0 { return unsupported("HEVC encoder SPS extension"); }
+            if range {
+                rext = SpsRext {
+                    transform_skip_rotation: r.flag()?, transform_skip_context: r.flag()?,
+                    implicit_rdpcm: r.flag()?, explicit_rdpcm: r.flag()?, extended_precision: r.flag()?,
+                    intra_smoothing_disabled: r.flag()?, high_precision_offsets: r.flag()?,
+                    persistent_rice_adaptation: r.flag()?, cabac_bypass_alignment: r.flag()?,
+                };
+                if rext != SpsRext::default() { return unsupported("HEVC encoder range-extension tools"); }
+            }
+        }
+        let bytes = r.finish_rbsp(consumed.is_some())?;
+        if let Some(out) = consumed { *out = bytes + 2; }
+        encoder.level_idc = Some(level_idc);
+        encoder.tier = tier;
+    }
     Ok(Sps {
         id,
         profile_idc,
@@ -474,8 +536,77 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
         num_long_term_ref_pics_sps,
         temporal_mvp,
         strong_intra_smoothing,
-        rext: SpsRext::default(),
+        rext,
+        encoder,
     })
+}
+fn encoder_vui(r: &mut BitReader, layers: u32) -> VResult<EncoderSequence> {
+    let mut result = EncoderSequence::default();
+    if r.flag()? {
+        let idc = r.u(8)? as u8; result.aspect_ratio_idc = Some(idc);
+        if idc == 255 { result.sar = [r.u(16)? as u16, r.u(16)? as u16]; }
+    }
+    if r.flag()? { r.skip(1)?; }
+    if r.flag()? {
+        r.skip(3)?; result.full_range = r.flag()?;
+        if r.flag()? { result.colour = Some([r.u(8)? as u8, r.u(8)? as u8, r.u(8)? as u8]); }
+    }
+    if r.flag()? { r.ue()?; r.ue()?; }
+    r.skip(1)?;
+    if r.flag()? { return unsupported("HEVC encoder field sequence"); }
+    r.skip(1)?;
+    if r.flag()? { for _ in 0..4 { r.ue()?; } }
+    if r.flag()? {
+        result.timing = Some(encoder_timing(r)?);
+        if r.flag()? { result.hrd = Some(encoder_hrd(r, layers)?); }
+    }
+    if r.flag()? {
+        r.skip(3)?;
+        for _ in 0..5 { r.ue()?; }
+    }
+    Ok(result)
+}
+
+pub(crate) fn encoder_timing(r: &mut BitReader) -> VResult<EncoderTiming> {
+    let num_units_in_tick = r.u(32)?;
+    let time_scale = r.u(32)?;
+    if num_units_in_tick == 0 || time_scale == 0 { return bitstream("zero HEVC timing clock"); }
+    let poc_ticks = if r.flag()? { Some(u64::from(r.ue()?) + 1) } else { None };
+    Ok(EncoderTiming { num_units_in_tick, time_scale, poc_ticks })
+}
+
+pub(crate) fn encoder_hrd(r: &mut BitReader, layers: u32) -> VResult<EncoderHrd> {
+    if layers != 0 { return unsupported("HEVC encoder HRD temporal sublayers"); }
+    let nal = r.flag()?;
+    let vcl = r.flag()?;
+    if !nal && !vcl { return unsupported("HEVC encoder HRD without CPB"); }
+    if r.flag()? { return unsupported("HEVC encoder sub-picture HRD"); }
+    let bitrate_scale = r.u(4)?;
+    let size_scale = r.u(4)?;
+    let initial_cpb_removal_delay_length = r.u(5)? + 1;
+    let au_cpb_removal_delay_length = r.u(5)? + 1;
+    let dpb_output_delay_length = r.u(5)? + 1;
+    let fixed_general = r.flag()?;
+    let fixed = fixed_general || r.flag()?;
+    let fixed_duration = if fixed { Some(u64::from(r.ue()?) + 1) } else { None };
+    let low_delay = !fixed && r.flag()?;
+    let count = if low_delay { 1 } else { r.ue_max(31, "cpb_cnt_minus1")? + 1 };
+    let mut read_cpb = |present| -> VResult<Vec<(u64, u64, bool)>> {
+        let mut cpb = Vec::new();
+        if present {
+            cpb.reserve(count as usize);
+            for _ in 0..count {
+                let bitrate = (u64::from(r.ue()?) + 1) << (6 + bitrate_scale);
+                let size = (u64::from(r.ue()?) + 1) << (4 + size_scale);
+                cpb.push((bitrate, size, r.flag()?));
+            }
+        }
+        Ok(cpb)
+    };
+    let nal = read_cpb(nal)?;
+    let vcl = read_cpb(vcl)?;
+    Ok(EncoderHrd { nal, vcl, initial_cpb_removal_delay_length,
+        au_cpb_removal_delay_length, dpb_output_delay_length, fixed_duration, low_delay })
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +710,16 @@ impl Default for PpsRext {
 }
 
 pub fn parse_pps(rbsp: &[u8]) -> VResult<Pps> {
+    parse_pps_inner(rbsp, false, None)
+}
+pub(crate) fn parse_pps_for_encode(rbsp: &[u8]) -> VResult<Pps> {
+    parse_pps_inner(rbsp, true, None)
+}
+pub(crate) fn unescaped_pps_len(rbsp: &[u8]) -> VResult<usize> {
+    let mut bytes = 0; parse_pps_inner(rbsp, true, Some(&mut bytes))?; Ok(bytes)
+}
+fn parse_pps_inner(rbsp: &[u8], encode: bool, consumed: Option<&mut usize>) -> VResult<Pps> {
+    if rbsp.len() < 3 { return bitstream("truncated HEVC PPS"); }
     let mut r = BitReader::new(&rbsp[2..]);
     let r = &mut r;
     let id = r.ue_max(63, "pps_pic_parameter_set_id")?;
@@ -658,6 +799,11 @@ pub fn parse_pps(rbsp: &[u8]) -> VResult<Pps> {
         if range || others != 0 {
             return unsupported("HEVC PPS range/multilayer/3D/SCC extension");
         }
+        if encode && r.u(4)? != 0 { return unsupported("HEVC PPS extension data"); }
+    }
+    if encode {
+        let bytes = r.finish_rbsp(consumed.is_some())?;
+        if let Some(out) = consumed { *out = bytes + 2; }
     }
     Ok(Pps {
         id,

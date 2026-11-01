@@ -139,15 +139,32 @@ fn scaling_matrices(
     Ok(m)
 }
 
+/// HRD syntax retained for clients which supply buffering-period/picture-timing SEI.
+#[derive(Debug, Clone)]
+pub struct Hrd {
+    pub cpb: Vec<(u64, u64, bool)>,
+    pub initial_cpb_removal_delay_length: u32,
+    pub cpb_removal_delay_length: u32,
+    pub dpb_output_delay_length: u32,
+    pub time_offset_length: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Vui {
     pub colour_primaries: u32,
     pub transfer_characteristics: u32,
     pub matrix_coefficients: u32,
     pub full_range: bool,
+    pub aspect_ratio_idc: Option<u8>,
+    pub sar: [u16; 2],
     /// bitstream_restriction: max_num_reorder_frames / max_dec_frame_buffering.
     pub max_num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
+    pub timing: Option<(u32, u32, bool)>,
+    pub nal_hrd: Option<Hrd>,
+    pub vcl_hrd: Option<Hrd>,
+    pub low_delay_hrd: bool,
+    pub pic_struct_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -204,15 +221,23 @@ impl Sps {
     }
 }
 
-fn hrd(r: &mut BitReader) -> VResult<()> {
+fn hrd(r: &mut BitReader) -> VResult<Hrd> {
     let cnt = r.ue_max(31, "cpb_cnt_minus1")? + 1;
-    r.skip(8)?;
+    let bitrate_scale = r.u(4)?;
+    let size_scale = r.u(4)?;
+    let mut cpb = Vec::with_capacity(cnt as usize);
     for _ in 0..cnt {
-        r.ue()?;
-        r.ue()?;
-        r.skip(1)?;
+        let bitrate = (u64::from(r.ue()?) + 1) << (6 + bitrate_scale);
+        let size = (u64::from(r.ue()?) + 1) << (4 + size_scale);
+        cpb.push((bitrate, size, r.flag()?));
     }
-    r.skip(20)
+    Ok(Hrd {
+        cpb,
+        initial_cpb_removal_delay_length: r.u(5)? + 1,
+        cpb_removal_delay_length: r.u(5)? + 1,
+        dpb_output_delay_length: r.u(5)? + 1,
+        time_offset_length: r.u(5)?,
+    })
 }
 
 fn vui(r: &mut BitReader) -> VResult<Vui> {
@@ -222,8 +247,9 @@ fn vui(r: &mut BitReader) -> VResult<Vui> {
         matrix_coefficients: 2,
         ..Default::default()
     };
-    if r.flag()? && r.u(8)? == 255 {
-        r.skip(32)?; // Extended_SAR
+    if r.flag()? {
+        let idc = r.u(8)? as u8; v.aspect_ratio_idc = Some(idc);
+        if idc == 255 { v.sar = [r.u(16)? as u16, r.u(16)? as u16]; }
     }
     if r.flag()? {
         r.skip(1)?; // overscan_appropriate
@@ -242,20 +268,20 @@ fn vui(r: &mut BitReader) -> VResult<Vui> {
         r.ue()?;
     }
     if r.flag()? {
-        r.skip(65)?; // num_units_in_tick, time_scale, fixed_frame_rate
+        v.timing = Some((r.u(32)?, r.u(32)?, r.flag()?));
     }
     let nal_hrd = r.flag()?;
     if nal_hrd {
-        hrd(r)?;
+        v.nal_hrd = Some(hrd(r)?);
     }
     let vcl_hrd = r.flag()?;
     if vcl_hrd {
-        hrd(r)?;
+        v.vcl_hrd = Some(hrd(r)?);
     }
     if nal_hrd || vcl_hrd {
-        r.skip(1)?; // low_delay_hrd_flag
+        v.low_delay_hrd = r.flag()?;
     }
-    r.skip(1)?; // pic_struct_present_flag
+    v.pic_struct_present = r.flag()?;
     if r.flag()? {
         r.skip(1)?;
         for _ in 0..4 {
@@ -268,6 +294,15 @@ fn vui(r: &mut BitReader) -> VResult<Vui> {
 }
 
 pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
+    parse_sps_inner(rbsp, false, None)
+}
+pub(crate) fn parse_sps_for_encode(rbsp: &[u8]) -> VResult<Sps> {
+    parse_sps_inner(rbsp, true, None)
+}
+pub(crate) fn unescaped_sps_len(rbsp: &[u8]) -> VResult<usize> {
+    let mut bytes = 0; parse_sps_inner(rbsp, true, Some(&mut bytes))?; Ok(bytes)
+}
+fn parse_sps_inner(rbsp: &[u8], encode: bool, consumed: Option<&mut usize>) -> VResult<Sps> {
     let mut r = BitReader::new(rbsp);
     r.skip(8)?; // NAL header
     let profile_idc = r.u(8)? as u8;
@@ -365,6 +400,10 @@ pub fn parse_sps(rbsp: &[u8]) -> VResult<Sps> {
     if r.flag()? {
         s.vui = vui(&mut r)?;
     }
+    if encode {
+        let bytes = r.finish_rbsp(consumed.is_some())?;
+        if let Some(out) = consumed { *out = bytes; }
+    }
     Ok(s)
 }
 
@@ -391,13 +430,22 @@ pub struct Pps {
 
 /// `sps_lookup` resolves the referenced SPS (needed for chroma_format_idc and fall-back rule B).
 pub fn parse_pps(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResult<Pps> {
+    parse_pps_inner(rbsp, sps_lookup, false, None)
+}
+pub(crate) fn parse_pps_for_encode(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResult<Pps> {
+    parse_pps_inner(rbsp, sps_lookup, true, None)
+}
+pub(crate) fn unescaped_pps_len(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResult<usize> {
+    let mut bytes = 0; parse_pps_inner(rbsp, sps_lookup, true, Some(&mut bytes))?; Ok(bytes)
+}
+fn parse_pps_inner(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>, encode: bool, consumed: Option<&mut usize>) -> VResult<Pps> {
+    let prefix = consumed.is_some();
     let mut r = BitReader::new(rbsp);
     r.skip(8)?;
     let id = r.ue_max(255, "pic_parameter_set_id")?;
     let sps_id = r.ue_max(31, "seq_parameter_set_id")?;
-    let Some(sps) = sps_lookup(sps_id) else {
-        return bitstream(format!("PPS {id} references missing SPS {sps_id}"));
-    };
+    let sps = sps_lookup(sps_id);
+    if sps.is_none() && !prefix { return bitstream(format!("PPS {id} references missing SPS {sps_id}")); }
     let entropy_coding_mode = r.flag()?;
     let bfpo = r.flag()?;
     if r.ue()? > 0 {
@@ -408,7 +456,7 @@ pub fn parse_pps(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResul
     let weighted_pred = r.flag()?;
     let weighted_bipred_idc = r.u(2)?;
     let pic_init_qp_minus26 = r.se_range(
-        -(26 + 6 * sps.bit_depth_luma_minus8 as i32),
+        -(26 + 6 * sps.as_ref().map_or(0, |s| s.bit_depth_luma_minus8) as i32),
         25,
         "pic_init_qp_minus26",
     )?;
@@ -433,11 +481,13 @@ pub fn parse_pps(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResul
         redundant_pic_cnt_present,
         transform_8x8_mode: false,
         second_chroma_qp_index_offset: chroma_qp_index_offset,
-        scaling: sps.scaling.clone(),
+        // Extent-only parsing never exposes these inferred matrices as picture semantics.
+        scaling: sps.as_ref().map_or_else(ScalingMatrices::flat, |s| s.scaling.clone()),
     };
-    if r.more_rbsp_data() {
+    if if prefix { r.more_rbsp_data_in_prefix() } else { r.more_rbsp_data() } {
         p.transform_8x8_mode = r.flag()?;
         if r.flag()? {
+            let sps = sps.as_ref().ok_or_else(|| super::super::VideoError::Bitstream("raw PPS scaling matrices require its SPS".into()))?;
             let n =
                 6 + if sps.chroma_format_idc != 3 { 2 } else { 6 } * p.transform_8x8_mode as usize;
             // 7.4.2.2: fall-back rule A when the SPS carries no matrices, rule B otherwise.
@@ -446,5 +496,10 @@ pub fn parse_pps(rbsp: &[u8], sps_lookup: impl Fn(u32) -> Option<Sps>) -> VResul
         }
         p.second_chroma_qp_index_offset = r.se_range(-12, 12, "second_chroma_qp_index_offset")?;
     }
+    if encode {
+        let bytes = r.finish_rbsp(prefix)?;
+        if let Some(out) = consumed { *out = bytes; }
+    }
     Ok(p)
 }
+

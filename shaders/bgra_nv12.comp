@@ -1,5 +1,5 @@
-// BGRA (bytes B, G, R, A/X) -> pitch-linear NV12, BT.709 video range, bit-exact with the CPU
-// conversion it replaces (src/video/enc/layout.rs bgra_rows): the same fixed-point coefficients,
+// Packed RGB -> pitch-linear NV12, BT.709 video range, bit-exact with the CPU BGRA
+// conversion (src/video/enc/layout.rs bgra_rows): the same fixed-point coefficients,
 // rounding and arithmetic right shifts, chroma from the 2x2 sum, the last column and row repeated
 // for odd sizes. One invocation: 4 columns x 2 rows of luma and the 2 CbCr pairs below them.
 // Columns past the width land in the row padding of the outputs (pitches are 64-byte multiples).
@@ -14,11 +14,16 @@ layout(push_constant) uniform Push {
     uint src_pitch;    // bytes
     uint luma_pitch;   // bytes
     uint chroma_pitch; // bytes
+    uint order; // 0=B,G,R,A; 1=R,G,B,A; 2=A,R,G,B
 } p;
 
 ivec3 rgb(uint x, uint y)
 {
     uint v = px[(y * p.src_pitch) / 4u + x];
+    if (p.order == 1u)
+        return ivec3(int(v & 255u), int((v >> 8) & 255u), int((v >> 16) & 255u));
+    if (p.order == 2u)
+        return ivec3(int((v >> 8) & 255u), int((v >> 16) & 255u), int(v >> 24));
     return ivec3(int((v >> 16) & 255u), int((v >> 8) & 255u), int(v & 255u));
 }
 

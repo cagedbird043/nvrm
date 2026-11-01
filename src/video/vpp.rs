@@ -10,7 +10,7 @@
 //! [`Processor::supported`] tells the frontend whether to offer VideoProc at all.
 use super::{
     compute::ComputeEngine,
-    enc::ingest::{Ingest, Layout, Plane},
+    enc::ingest::{check_plane, Layout, Plane},
     open_render_node, open_rm,
     session::{vram, CopyEngine, VramBuffer},
     VResult, VideoError,
@@ -32,6 +32,14 @@ pub enum RgbOrder {
     Bgra,
     /// R, G, B, A/X in memory.
     Rgba,
+    /// A/X, R, G, B in memory (VA ARGB/XRGB, DRM BGRA8888/BGRX8888).
+    Argb,
+}
+
+impl RgbOrder {
+    pub(crate) fn code(self) -> u32 {
+        match self { Self::Bgra => 0, Self::Rgba => 1, Self::Argb => 2 }
+    }
 }
 
 /// Sample layout of a picture. YUV samples of more than 8 bits sit in the high bits of 16-bit
@@ -316,7 +324,7 @@ impl Processor {
         for (p, plane) in planes[..pic.pixels.planes()].iter().enumerate() {
             let (address, size) = self.import(*key, plane.fd)?;
             let (line, rows) = pic.pixels.plane_extent(p, pic.width, pic.height);
-            Ingest::check_plane(*layout, plane, line, rows, size)?;
+            check_plane(*layout, plane, line, rows, size)?;
             out.push(Surface { address: address + plane.offset, pitch: plane.pitch, layout: *layout });
         }
         Ok(out)
@@ -508,7 +516,7 @@ impl Processor {
             Pixels::Rgb(_) => 2,
         };
         let shift = |p: Pixels| if p.bps() == 2 { 16 - p.bits() } else { 0 };
-        let order = |p: Pixels| u32::from(p == Pixels::Rgb(RgbOrder::Rgba));
+        let order = |p: Pixels| match p { Pixels::Rgb(order) => order.code(), _ => 0 };
         let f = |v: f64| (v as f32).to_bits();
         let pitch = |i: usize| inputs.get(i).map_or(0, |v| v.1);
         let (s, d) = (op.src_rect, op.dst_rect);
